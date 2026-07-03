@@ -3,8 +3,10 @@ from discord import app_commands
 import gspread
 from google.oauth2.service_account import Credentials
 from collections import Counter
+from enum import Enum
 import os
 import json
+
 
 # =========================================================
 # 🔐 DISCORD TOKEN
@@ -39,6 +41,10 @@ sheet = spreadsheet.sheet1
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
+class StatisticsMode(Enum):
+    halloffame = "halloffame"
+    siegerderherzen = "siegerderherzen"
 
 # =========================================================
 # 🏆 HALL OF FAME
@@ -115,10 +121,13 @@ def get_community():
 # 🎮 SLASH COMMAND
 # =========================================================
 @tree.command(name="statistics", description="Twilight Imperium Statistiken")
-@app_commands.describe(mode="halloffame oder siegerderherzen")
-async def statistics(interaction: discord.Interaction, mode: str):
+@app_commands.describe(mode="Welche Statistik möchtest du sehen?")
+async def statistics(
+    interaction: discord.Interaction,
+    mode: StatisticsMode
+):
 
-    mode = mode.lower()
+    mode = mode.value
 
     # -------------------------
     # 🏆 HALL OF FAME
