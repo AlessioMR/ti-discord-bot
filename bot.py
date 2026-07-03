@@ -6,6 +6,7 @@ from collections import Counter
 import os
 import json
 import re
+import time
 
 # =========================================================
 # 🔐 DISCORD TOKEN
@@ -99,6 +100,11 @@ PLAYER_COLUMN_CANDIDATES = [
     "Spieler (VP, Volk)",
     "Spieler (Volk, VP)"
 ]
+
+_player_name_cache = {
+    "timestamp": 0,
+    "names": []
+}
 
 
 def normalize_name(name: str) -> str:
@@ -261,6 +267,60 @@ def parse_game_players(raw: str):
             result.append(parsed)
 
     return result
+
+
+def get_all_player_names_cached():
+    """
+    Holt alle bekannten Spielernamen für Discord Autocomplete.
+    Cache verhindert, dass bei jedem Tastendruck Google Sheets neu abgefragt wird.
+    """
+    now = time.time()
+
+    if now - _player_name_cache["timestamp"] < 300 and _player_name_cache["names"]:
+        return _player_name_cache["names"]
+
+    rows = get_rows()
+    names = set()
+
+    for row in rows:
+        winner = row.get("Gewinner")
+        if winner and str(winner).strip():
+            names.add(str(winner).strip())
+
+        for community_name in split_community_names(row.get("Community Preis")):
+            names.add(community_name)
+
+        for player in parse_game_players(get_player_column(row)):
+            if player["name"]:
+                names.add(player["name"])
+
+    sorted_names = sorted(names, key=lambda x: x.lower())
+
+    _player_name_cache["timestamp"] = now
+    _player_name_cache["names"] = sorted_names
+
+    return sorted_names
+
+
+async def player_name_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+    names = get_all_player_names_cached()
+    current_lower = current.lower()
+
+    if current_lower:
+        filtered = [
+            name for name in names
+            if current_lower in name.lower()
+        ]
+    else:
+        filtered = names
+
+    return [
+        app_commands.Choice(name=name, value=name)
+        for name in filtered[:25]
+    ]
 
 
 def get_target_points(row, players):
@@ -563,7 +623,7 @@ async def halloffame(interaction: discord.Interaction):
 
     data = get_halloffame()
 
-    text = "🏆 **Twilight Imperium Hall of Fame**\n\n"
+    text = ""
 
     for rank, player, wins in data:
         if rank == 1:
@@ -578,7 +638,7 @@ async def halloffame(interaction: discord.Interaction):
         text += f"{medal} **{player}** — {format_count_sieg(wins)}\n"
 
     embed = discord.Embed(
-        title="Hall of Fame",
+        title="🏆 Hall of Fame",
         description=text,
         color=0xF1C40F
     )
@@ -598,7 +658,7 @@ async def siegerderherzen(interaction: discord.Interaction):
 
     data = get_community()
 
-    text = "❤️ **Sieger der Herzen**\n\n"
+    text = ""
 
     medal_map = ["🥇", "🥈", "🥉"]
     last_count = None
@@ -618,7 +678,7 @@ async def siegerderherzen(interaction: discord.Interaction):
         text += f"{medal} **{player}** — {format_count_preis(count)}\n"
 
     embed = discord.Embed(
-        title="Sieger der Herzen",
+        title="❤️ Sieger der Herzen",
         description=text,
         color=0xE74C3C
     )
@@ -634,6 +694,7 @@ async def siegerderherzen(interaction: discord.Interaction):
     description="Zeigt eine Spielerstatistik"
 )
 @app_commands.describe(name="Spielername")
+@app_commands.autocomplete(name=player_name_autocomplete)
 async def player(interaction: discord.Interaction, name: str):
     await interaction.response.defer()
 
@@ -659,10 +720,7 @@ async def player(interaction: discord.Interaction, name: str):
     if stats["avg_normalized_vp"] is None:
         avg_normalized_text = "Keine berechenbaren VP"
     else:
-        avg_normalized_text = (
-            f"{stats['avg_normalized_vp']:.2f} VP "
-            f"(aus {stats['known_normalized_vp_games']} Spielen)"
-        )
+        avg_normalized_text = f"{stats['avg_normalized_vp']:.2f} VP"
 
     embed = discord.Embed(
         title=f"Spielerstatistik: {name}",
