@@ -2,9 +2,10 @@ import discord
 from discord import app_commands
 import gspread
 from google.oauth2.service_account import Credentials
-from collections import Counter, defaultdict
+from collections import Counter
 import os
 import json
+import re
 
 # =========================================================
 # 🔐 DISCORD TOKEN
@@ -48,19 +49,59 @@ statistics = app_commands.Group(
 tree.add_command(statistics)
 
 # =========================================================
-# 📦 HELPER
+# 🧠 HELPERS
 # =========================================================
+def normalize_name(name: str):
+    return name.strip().lower()
+
 def parse_players(entry: str):
     if not entry:
         return []
     return [p.strip() for p in str(entry).split(",") if p.strip()]
 
-def normalize_score(val):
-    try:
-        val = str(val).strip()
-        return float(val)
-    except:
-        return 0.0
+def parse_game_players(raw: str):
+    """
+    Robust parser for:
+    1. Chris (Faction, 10)
+    """
+    if not raw:
+        return []
+
+    result = []
+
+    entries = raw.split(",")
+
+    for e in entries:
+        e = e.strip()
+
+        # remove numbering "1. "
+        e = re.sub(r"^\d+\.\s*", "", e)
+
+        try:
+            name_part = e.split("(")[0].strip()
+            inside = e.split("(")[1].replace(")", "")
+
+            parts = inside.split(",")
+
+            faction = parts[0].strip() if len(parts) > 0 else "Unknown"
+
+            vp = 0
+            if len(parts) > 1:
+                try:
+                    vp = float(parts[1].strip())
+                except:
+                    vp = 0
+
+            result.append({
+                "name": name_part,
+                "faction": faction,
+                "vp": vp
+            })
+
+        except:
+            continue
+
+    return result
 
 # =========================================================
 # 🏆 HALL OF FAME
@@ -69,6 +110,7 @@ def get_halloffame():
     data = sheet.get_all_records()
 
     winners = []
+
     for row in data:
         w = row.get("Gewinner")
         if w and str(w).strip():
@@ -83,6 +125,7 @@ def get_halloffame():
     skip = 0
 
     for player, wins in sorted_data:
+
         if wins != last_wins:
             rank += 1 + skip
             skip = 0
@@ -109,83 +152,64 @@ def get_community():
     return Counter(players)
 
 # =========================================================
-# 📊 PLAYER STATISTICS CORE
+# 👤 PLAYER STATS
 # =========================================================
 def get_player_stats(name: str):
+
     data = sheet.get_all_records()
 
-    games_played = 0
+    n = normalize_name(name)
+
+    games = 0
     wins = 0
     community = 0
-    total_score = 0.0
-    normalized_score = 0.0
+    total_vp = 0.0
 
-    faction_counter = Counter()
+    factions = Counter()
     faction_wins = Counter()
 
     for row in data:
 
-        players_raw = row.get("Spieler (Volk, VP)")
-        if not players_raw:
+        players = parse_game_players(row.get("Spieler (Volk, VP)"))
+        if not players:
             continue
 
-        players = parse_players(players_raw)
-
         found = False
-        game_score = 0.0
 
-        for entry in players:
-            if "(" not in entry:
-                continue
+        for p in players:
 
-            try:
-                player_name = entry.split("(")[0].strip()
-                faction = entry.split("(")[1].split(",")[0].strip()
-                score = entry.split(",")[1].replace(")", "").strip()
-                score = normalize_score(score)
-            except:
-                continue
+            if normalize_name(p["name"]) == n:
 
-            if player_name == name:
                 found = True
-                faction_counter[faction] += 1
-                total_score += score
-                normalized_score += (score / 10) * 10  # already normalized scale
-                game_score = score
+                games += 1
 
-        if found:
-            games_played += 1
+                total_vp += p["vp"]
+                factions[p["faction"]] += 1
 
-            if row.get("Gewinner") == name:
-                wins += 1
+                if normalize_name(row.get("Gewinner", "")) == n:
+                    wins += 1
+                    faction_wins[p["faction"]] += 1
 
-            for p in parse_players(row.get("Community Preis")):
-                if p == name:
-                    community += 1
+        for c in parse_players(row.get("Community Preis")):
+            if normalize_name(c) == n:
+                community += 1
 
-            # faction win tracking
-            if row.get("Gewinner") == name:
-                for entry in players:
-                    if name in entry:
-                        faction = entry.split("(")[1].split(",")[0].strip()
-                        faction_wins[faction] += 1
-
-    winrate = (wins / games_played * 100) if games_played else 0
-    avg_score = (total_score / games_played) if games_played else 0
+    winrate = (wins / games * 100) if games else 0
+    avg_vp = (total_vp / games) if games else 0
 
     return {
-        "games": games_played,
+        "games": games,
         "wins": wins,
         "community": community,
         "winrate": winrate,
-        "total_score": total_score,
-        "avg_score": avg_score,
-        "factions": faction_counter,
+        "total_vp": total_vp,
+        "avg_vp": avg_vp,
+        "factions": factions,
         "faction_wins": faction_wins
     }
 
 # =========================================================
-# 🏆 halloffame
+# 🏆 /statistics halloffame
 # =========================================================
 @statistics.command(name="halloffame")
 async def halloffame(interaction: discord.Interaction):
@@ -196,10 +220,7 @@ async def halloffame(interaction: discord.Interaction):
 
     for rank, player, wins in data:
 
-        if wins == 1:
-            win_text = "1 Sieg"
-        else:
-            win_text = f"{wins} Siege"
+        win_text = "1 Sieg" if wins == 1 else f"{wins} Siege"
 
         if rank == 1:
             medal = "🥇"
@@ -215,12 +236,13 @@ async def halloffame(interaction: discord.Interaction):
     await interaction.response.send_message(text)
 
 # =========================================================
-# ❤️ sieger der herzen
+# ❤️ /statistics siegerderherzen
 # =========================================================
 @statistics.command(name="siegerderherzen")
 async def siegerderherzen(interaction: discord.Interaction):
 
     data = get_community()
+
     text = "❤️ **Sieger der Herzen**\n\n"
 
     medal_map = ["🥇", "🥈", "🥉"]
@@ -241,7 +263,7 @@ async def siegerderherzen(interaction: discord.Interaction):
     await interaction.response.send_message(text)
 
 # =========================================================
-# 👤 PLAYER STATISTICS
+# 👤 /statistics player
 # =========================================================
 @statistics.command(name="player")
 @app_commands.describe(name="Spielername")
@@ -249,8 +271,8 @@ async def player(interaction: discord.Interaction, name: str):
 
     s = get_player_stats(name)
 
-    factions = "\n".join([f"{f}: {c}" for f, c in s["factions"].most_common()]) or "Keine Daten"
-    faction_wins = "\n".join([f"{f}: {c} Siege" for f, c in s["faction_wins"].most_common()]) or "Keine Daten"
+    factions = "\n".join([f"{k}: {v}" for k, v in s["factions"].most_common()]) or "Keine Daten"
+    faction_wins = "\n".join([f"{k}: {v}" for k, v in s["faction_wins"].most_common()]) or "Keine Daten"
 
     text = f"""
 👤 **Statistik für {name}**
@@ -261,8 +283,8 @@ async def player(interaction: discord.Interaction, name: str):
 
 📊 Winrate: {s['winrate']:.1f}%
 
-⭐ Gesamt VP: {s['total_score']:.1f}
-📈 Ø VP: {s['avg_score']:.2f}
+⭐ Gesamt VP: {s['total_vp']:.1f}
+📈 Ø VP: {s['avg_vp']:.2f}
 
 🌍 Völker gespielt:
 {factions}
@@ -274,7 +296,7 @@ async def player(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(text)
 
 # =========================================================
-# 🚀 BOT
+# 🚀 START
 # =========================================================
 @client.event
 async def on_ready():
