@@ -3,6 +3,7 @@ from discord import app_commands
 import gspread
 from google.oauth2.service_account import Credentials
 from collections import Counter
+import os
 
 # =========================================================
 # 🔐 DISCORD TOKEN
