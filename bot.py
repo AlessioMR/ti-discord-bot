@@ -18,14 +18,16 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
 
-creds = Credentials.from_service_account_file(
+creds = Credentials.from_service_account_info(
     creds_json,
     scopes=SCOPES
 )
 
 gc = gspread.authorize(creds)
 
-# 👉 GOOGLE SHEET ID
+# =========================================================
+# 📄 SHEET ID
+# =========================================================
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
@@ -45,10 +47,9 @@ def get_halloffame():
     data = sheet.get_all_records()
 
     winners = []
-
     for row in data:
         w = row.get("Gewinner")
-        if w and str(w).strip() != "":
+        if w and str(w).strip():
             winners.append(str(w).strip())
 
     counts = Counter(winners)
@@ -60,7 +61,6 @@ def get_halloffame():
     skip = 0
 
     for player, wins in sorted_data:
-
         if wins != last_wins:
             rank += 1 + skip
             skip = 0
@@ -73,7 +73,7 @@ def get_halloffame():
     return result
 
 # =========================================================
-# ❤️ COMMUNITY PREIS
+# ❤️ SIEGER DER HERZEN (FIXED TIE LOGIC)
 # =========================================================
 def get_community():
     data = sheet.get_all_records()
@@ -83,7 +83,7 @@ def get_community():
     for row in data:
         entry = row.get("Community Preis")
 
-        if entry and str(entry).strip() != "":
+        if entry and str(entry).strip():
             parts = str(entry).split(",")
 
             for p in parts:
@@ -94,14 +94,12 @@ def get_community():
     counts = Counter(players)
     sorted_data = counts.most_common()
 
-    # stabile Rankings (keine Skip-Bugs)
     result = []
     last_count = None
     rank = 0
     skip = 0
 
     for player, count in sorted_data:
-
         if count != last_count:
             rank += 1 + skip
             skip = 0
@@ -132,7 +130,6 @@ async def statistics(interaction: discord.Interaction, mode: str):
         text = "🏆 **Twilight Imperium Hall of Fame**\n\n"
 
         for rank, player, wins in data:
-
             if rank == 1:
                 medal = "🥇"
             elif rank == 2:
@@ -154,48 +151,45 @@ async def statistics(interaction: discord.Interaction, mode: str):
         return
 
     # -------------------------
-    # ❤️ SIEGER DER HERZEN
+    # ❤️ SIEGER DER HERZEN (FIXED MEDAL GROUPS)
     # -------------------------
     if mode == "siegerderherzen":
 
         data = get_community()
-    
+
         text = "❤️ **Sieger der Herzen**\n\n"
-    
+
+        medal_map = ["🥇", "🥈", "🥉"]
         last_count = None
         medal_index = 0
-    
-        medal_map = ["🥇", "🥈", "🥉"]
-    
+
         for rank, player, count in data:
-    
-            # 🧠 neue Gruppe (neue Sieganzahl)
+
+            # neue Gruppe (gleich viele Stimmen = gleiche Medaille)
             if count != last_count:
                 last_count = count
-    
-                if medal_index < 3:
+
+                if medal_index < len(medal_map):
                     medal = medal_map[medal_index]
                 else:
                     medal = f"{medal_index + 1}."
-    
+
                 medal_index += 1
-    
-            # gleiche Gruppe → gleiche Medaille
-            # (wird NICHT erhöht)
-    
+
+            # Label
             if count == 1:
                 label = "1-facher Preisträger"
             else:
                 label = f"{count}-facher Preisträger"
-    
+
             text += f"{medal} **{player}** — {label}\n"
-    
+
         embed = discord.Embed(
             title="Sieger der Herzen",
             description=text,
             color=0xE74C3C
         )
-    
+
         await interaction.response.send_message(embed=embed)
         return
 
