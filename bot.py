@@ -49,72 +49,221 @@ statistics = app_commands.Group(
 tree.add_command(statistics)
 
 # =========================================================
-# 🧠 HELPERS
+# 🧠 CONSTANTS / HELPERS
 # =========================================================
-def normalize_name(name: str):
-    return name.strip().lower()
+KNOWN_FACTIONS = {
+    "arborec", "argent", "barony", "cabal", "creuss", "empyrean",
+    "hacan", "jol nar", "jolnar", "keleres", "l1", "letnev",
+    "mahact", "mentak", "muaat", "naalu", "naaz", "nekro",
+    "nomad", "saar", "sardakk", "sol", "titans", "winnu",
+    "xxcha", "yin", "yssaril",
 
-def parse_players(entry: str):
+    # Custom / Homebrew / Varianten aus eurem Sheet
+    "dws", "crimson", "bastion", "obsidian", "ralnel",
+    "tf_orange", "tf_grün", "tf_lila", "tf_gelb", "tf_rot"
+}
+
+PLAYER_COLUMN_CANDIDATES = [
+    "Spieler (VP, Volk)",
+    "Spieler (Volk, VP)"
+]
+
+
+def normalize_name(name: str) -> str:
+    return str(name).strip().lower()
+
+
+def clean_text(value: str) -> str:
+    return str(value).strip()
+
+
+def parse_number(value):
+    if value is None:
+        return None
+
+    text = str(value).strip().replace(",", ".")
+
+    if text == "":
+        return None
+
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def get_rows():
+    return sheet.get_all_records()
+
+
+def get_player_column(row):
+    for column_name in PLAYER_COLUMN_CANDIDATES:
+        if column_name in row and row.get(column_name):
+            return row.get(column_name)
+    return ""
+
+
+def split_community_names(entry: str):
     if not entry:
         return []
-    return [p.strip() for p in str(entry).split(",") if p.strip()]
 
-def parse_game_players(raw: str):
+    return [
+        name.strip()
+        for name in str(entry).split(",")
+        if name.strip()
+    ]
+
+
+def split_game_entries(raw: str):
     """
-    Robust parser for:
-    1. Chris (Faction, 10)
+    Trennt eine komplette Spieler-Zelle in einzelne Spieler-Einträge.
+
+    Beispiel:
+    "1. Chris (10, Yssaril), 2. Timo (9, Hacan)"
+
+    wird zu:
+    [
+        "Chris (10, Yssaril)",
+        "Timo (9, Hacan)"
+    ]
     """
     if not raw:
         return []
 
+    raw = str(raw).strip()
+
+    matches = re.findall(
+        r"\d+\.\s*(.*?)(?=,\s*\d+\.\s*|$)",
+        raw
+    )
+
+    return [m.strip() for m in matches if m.strip()]
+
+
+def parse_player_entry(entry: str):
+    """
+    Unterstützt:
+    - Chris (10, Yssaril)
+    - Chris (Yssaril, 10)
+    - Alessio (, Saar)
+    - Alessio (12, Nekro,)
+    - 4.Yogi (6, Nekro)
+
+    Gibt zurück:
+    {
+        "name": "Chris",
+        "vp": 10.0 oder None,
+        "faction": "Yssaril" oder None
+    }
+    """
+    if not entry:
+        return None
+
+    entry = str(entry).strip()
+    entry = re.sub(r"^\d+\.\s*", "", entry)
+
+    match = re.match(r"^(.*?)\s*\((.*?)\)\s*$", entry)
+
+    if not match:
+        return None
+
+    name = clean_text(match.group(1))
+    inside = match.group(2)
+
+    parts = [
+        p.strip()
+        for p in inside.split(",")
+        if p.strip() != ""
+    ]
+
+    vp = None
+    faction = None
+
+    for part in parts:
+        number = parse_number(part)
+
+        if number is not None and vp is None:
+            vp = number
+        elif number is None and faction is None:
+            faction = clean_text(part)
+
+    # Fallback: falls kein Volk erkannt wurde
+    if not faction:
+        faction = "Unbekannt"
+
+    # Autokorrektur für Fälle wie:
+    # "Keleres (11, Malte)" -> eigentlich "Malte (11, Keleres)"
+    if (
+        normalize_name(name) in KNOWN_FACTIONS
+        and normalize_name(faction) not in KNOWN_FACTIONS
+        and faction != "Unbekannt"
+    ):
+        name, faction = faction, name
+
+    return {
+        "name": name,
+        "vp": vp,
+        "faction": faction
+    }
+
+
+def parse_game_players(raw: str):
     result = []
 
-    entries = raw.split(",")
+    for entry in split_game_entries(raw):
+        parsed = parse_player_entry(entry)
 
-    for e in entries:
-        e = e.strip()
-
-        # remove numbering "1. "
-        e = re.sub(r"^\d+\.\s*", "", e)
-
-        try:
-            name_part = e.split("(")[0].strip()
-            inside = e.split("(")[1].replace(")", "")
-
-            parts = inside.split(",")
-
-            faction = parts[0].strip() if len(parts) > 0 else "Unknown"
-
-            vp = 0
-            if len(parts) > 1:
-                try:
-                    vp = float(parts[1].strip())
-                except:
-                    vp = 0
-
-            result.append({
-                "name": name_part,
-                "faction": faction,
-                "vp": vp
-            })
-
-        except:
-            continue
+        if parsed and parsed["name"]:
+            result.append(parsed)
 
     return result
+
+
+def get_target_points(row, players):
+    """
+    Normalisierung auf 10 Punkte.
+
+    Priorität:
+    1. Spalte "Punkte", falls vorhanden
+    2. VP des Gewinners
+    3. None, wenn nicht zuverlässig bestimmbar
+    """
+    points_from_sheet = parse_number(row.get("Punkte"))
+
+    if points_from_sheet and points_from_sheet > 0:
+        return points_from_sheet
+
+    winner = normalize_name(row.get("Gewinner", ""))
+
+    if winner:
+        for player in players:
+            if normalize_name(player["name"]) == winner and player["vp"]:
+                return player["vp"]
+
+    return None
+
+
+def format_count_sieg(count: int):
+    return "1 Sieg" if count == 1 else f"{count} Siege"
+
+
+def format_count_preis(count: int):
+    return "1-facher Preisträger" if count == 1 else f"{count}-facher Preisträger"
+
 
 # =========================================================
 # 🏆 HALL OF FAME
 # =========================================================
 def get_halloffame():
-    data = sheet.get_all_records()
+    rows = get_rows()
 
     winners = []
 
-    for row in data:
-        w = row.get("Gewinner")
-        if w and str(w).strip():
-            winners.append(str(w).strip())
+    for row in rows:
+        winner = row.get("Gewinner")
+
+        if winner and str(winner).strip():
+            winners.append(str(winner).strip())
 
     counts = Counter(winners)
     sorted_data = counts.most_common()
@@ -125,7 +274,6 @@ def get_halloffame():
     skip = 0
 
     for player, wins in sorted_data:
-
         if wins != last_wins:
             rank += 1 + skip
             skip = 0
@@ -137,91 +285,136 @@ def get_halloffame():
 
     return result
 
+
 # =========================================================
-# ❤️ COMMUNITY
+# ❤️ COMMUNITY PREIS
 # =========================================================
 def get_community():
-    data = sheet.get_all_records()
+    rows = get_rows()
 
     players = []
 
-    for row in data:
-        for p in parse_players(row.get("Community Preis")):
-            players.append(p)
+    for row in rows:
+        for name in split_community_names(row.get("Community Preis")):
+            players.append(name)
 
     return Counter(players)
+
 
 # =========================================================
 # 👤 PLAYER STATS
 # =========================================================
 def get_player_stats(name: str):
+    rows = get_rows()
 
-    data = sheet.get_all_records()
+    search_name = normalize_name(name)
 
-    n = normalize_name(name)
-
-    games = 0
+    games_played = 0
     wins = 0
-    community = 0
-    total_vp = 0.0
+    community_awards = 0
 
-    factions = Counter()
+    raw_vp_total = 0.0
+    known_raw_vp_games = 0
+
+    normalized_vp_total = 0.0
+    known_normalized_vp_games = 0
+
+    factions_played = Counter()
     faction_wins = Counter()
 
-    for row in data:
+    for row in rows:
+        players = parse_game_players(get_player_column(row))
 
-        players = parse_game_players(row.get("Spieler (Volk, VP)"))
         if not players:
             continue
 
-        found = False
+        target_points = get_target_points(row, players)
 
-        for p in players:
+        player_entry = None
 
-            if normalize_name(p["name"]) == n:
+        for player in players:
+            if normalize_name(player["name"]) == search_name:
+                player_entry = player
+                break
 
-                found = True
-                games += 1
+        winner_name = normalize_name(row.get("Gewinner", ""))
 
-                total_vp += p["vp"]
-                factions[p["faction"]] += 1
+        # Siege sollen mit Hall of Fame übereinstimmen:
+        # Quelle ist immer die Gewinner-Spalte.
+        if winner_name == search_name:
+            wins += 1
 
-                if normalize_name(row.get("Gewinner", "")) == n:
-                    wins += 1
-                    faction_wins[p["faction"]] += 1
+        # Community Preis unabhängig von Spielereintrag zählen
+        for community_name in split_community_names(row.get("Community Preis")):
+            if normalize_name(community_name) == search_name:
+                community_awards += 1
 
-        for c in parse_players(row.get("Community Preis")):
-            if normalize_name(c) == n:
-                community += 1
+        if not player_entry:
+            continue
 
-    winrate = (wins / games * 100) if games else 0
-    avg_vp = (total_vp / games) if games else 0
+        games_played += 1
+
+        faction = player_entry["faction"] or "Unbekannt"
+        vp = player_entry["vp"]
+
+        factions_played[faction] += 1
+
+        if winner_name == search_name:
+            faction_wins[faction] += 1
+
+        if vp is not None:
+            raw_vp_total += vp
+            known_raw_vp_games += 1
+
+            if target_points and target_points > 0:
+                normalized_vp_total += (vp / target_points) * 10
+                known_normalized_vp_games += 1
+
+    winrate = (wins / games_played * 100) if games_played else 0
+
+    avg_raw_vp = (
+        raw_vp_total / known_raw_vp_games
+        if known_raw_vp_games
+        else None
+    )
+
+    avg_normalized_vp = (
+        normalized_vp_total / known_normalized_vp_games
+        if known_normalized_vp_games
+        else None
+    )
 
     return {
-        "games": games,
+        "games_played": games_played,
         "wins": wins,
-        "community": community,
+        "community_awards": community_awards,
         "winrate": winrate,
-        "total_vp": total_vp,
-        "avg_vp": avg_vp,
-        "factions": factions,
+        "raw_vp_total": raw_vp_total,
+        "known_raw_vp_games": known_raw_vp_games,
+        "avg_raw_vp": avg_raw_vp,
+        "normalized_vp_total": normalized_vp_total,
+        "known_normalized_vp_games": known_normalized_vp_games,
+        "avg_normalized_vp": avg_normalized_vp,
+        "factions_played": factions_played,
         "faction_wins": faction_wins
     }
+
 
 # =========================================================
 # 🏆 /statistics halloffame
 # =========================================================
-@statistics.command(name="halloffame")
+@statistics.command(
+    name="halloffame",
+    description="Zeigt die Hall of Fame"
+)
 async def halloffame(interaction: discord.Interaction):
+    await interaction.response.defer()
 
     data = get_halloffame()
 
     text = "🏆 **Twilight Imperium Hall of Fame**\n\n"
 
     for rank, player, wins in data:
-
-        win_text = "1 Sieg" if wins == 1 else f"{wins} Siege"
-
         if rank == 1:
             medal = "🥇"
         elif rank == 2:
@@ -231,76 +424,143 @@ async def halloffame(interaction: discord.Interaction):
         else:
             medal = f"{rank}."
 
-        text += f"{medal} **{player}** — {win_text}\n"
+        text += f"{medal} **{player}** — {format_count_sieg(wins)}\n"
 
-    await interaction.response.send_message(text)
+    embed = discord.Embed(
+        title="Hall of Fame",
+        description=text,
+        color=0xF1C40F
+    )
+
+    await interaction.followup.send(embed=embed)
+
 
 # =========================================================
 # ❤️ /statistics siegerderherzen
 # =========================================================
-@statistics.command(name="siegerderherzen")
+@statistics.command(
+    name="siegerderherzen",
+    description="Zeigt die Community-Preisträger"
+)
 async def siegerderherzen(interaction: discord.Interaction):
+    await interaction.response.defer()
 
     data = get_community()
 
     text = "❤️ **Sieger der Herzen**\n\n"
 
     medal_map = ["🥇", "🥈", "🥉"]
-
-    last = None
-    i = 0
+    last_count = None
+    medal_index = 0
 
     for player, count in data.most_common():
+        if count != last_count:
+            last_count = count
 
-        if count != last:
-            last = count
-            medal = medal_map[i] if i < len(medal_map) else f"{i+1}."
-            i += 1
+            if medal_index < len(medal_map):
+                medal = medal_map[medal_index]
+            else:
+                medal = f"{medal_index + 1}."
 
-        label = "1-facher Preisträger" if count == 1 else f"{count}-facher Preisträger"
-        text += f"{medal} **{player}** — {label}\n"
+            medal_index += 1
 
-    await interaction.response.send_message(text)
+        text += f"{medal} **{player}** — {format_count_preis(count)}\n"
+
+    embed = discord.Embed(
+        title="Sieger der Herzen",
+        description=text,
+        color=0xE74C3C
+    )
+
+    await interaction.followup.send(embed=embed)
+
 
 # =========================================================
 # 👤 /statistics player
 # =========================================================
-@statistics.command(name="player")
+@statistics.command(
+    name="player",
+    description="Zeigt eine Spielerstatistik"
+)
 @app_commands.describe(name="Spielername")
 async def player(interaction: discord.Interaction, name: str):
+    await interaction.response.defer()
 
-    s = get_player_stats(name)
+    stats = get_player_stats(name)
 
-    factions = "\n".join([f"{k}: {v}" for k, v in s["factions"].most_common()]) or "Keine Daten"
-    faction_wins = "\n".join([f"{k}: {v}" for k, v in s["faction_wins"].most_common()]) or "Keine Daten"
+    factions_text = "\n".join(
+        f"• {faction}: {count}x"
+        for faction, count in stats["factions_played"].most_common()
+    ) or "Keine Daten"
 
-    text = f"""
-👤 **Statistik für {name}**
+    faction_wins_text = "\n".join(
+        f"• {faction}: {format_count_sieg(count)}"
+        for faction, count in stats["faction_wins"].most_common()
+    ) or "Keine Daten"
 
-🎮 Spiele: {s['games']}
-🏆 Siege: {s['wins']}
-❤️ Community Preise: {s['community']}
+    if stats["avg_raw_vp"] is None:
+        raw_vp_text = "Keine bekannten VP"
+        avg_raw_vp_text = "Keine bekannten VP"
+    else:
+        raw_vp_text = f"{stats['raw_vp_total']:.1f} VP aus {stats['known_raw_vp_games']} Spielen"
+        avg_raw_vp_text = f"{stats['avg_raw_vp']:.2f} VP"
 
-📊 Winrate: {s['winrate']:.1f}%
+    if stats["avg_normalized_vp"] is None:
+        avg_normalized_text = "Keine berechenbaren VP"
+    else:
+        avg_normalized_text = (
+            f"{stats['avg_normalized_vp']:.2f} VP "
+            f"(aus {stats['known_normalized_vp_games']} Spielen)"
+        )
 
-⭐ Gesamt VP: {s['total_vp']:.1f}
-📈 Ø VP: {s['avg_vp']:.2f}
+    embed = discord.Embed(
+        title=f"Spielerstatistik: {name}",
+        color=0x3498DB
+    )
 
-🌍 Völker gespielt:
-{factions}
+    embed.add_field(
+        name="Grundwerte",
+        value=(
+            f"🎮 Spiele: **{stats['games_played']}**\n"
+            f"🏆 Siege: **{stats['wins']}**\n"
+            f"❤️ Community Preise: **{stats['community_awards']}**\n"
+            f"📊 Winrate: **{stats['winrate']:.1f}%**"
+        ),
+        inline=False
+    )
 
-🏆 Siege mit Völkern:
-{faction_wins}
-"""
+    embed.add_field(
+        name="Siegpunkte",
+        value=(
+            f"⭐ Gesamt VP: **{raw_vp_text}**\n"
+            f"📈 Ø VP: **{avg_raw_vp_text}**\n"
+            f"⚖️ Ø VP normalisiert auf 10: **{avg_normalized_text}**"
+        ),
+        inline=False
+    )
 
-    await interaction.response.send_message(text)
+    embed.add_field(
+        name="Völker gespielt",
+        value=factions_text,
+        inline=False
+    )
+
+    embed.add_field(
+        name="Siege mit Völkern",
+        value=faction_wins_text,
+        inline=False
+    )
+
+    await interaction.followup.send(embed=embed)
+
 
 # =========================================================
-# 🚀 START
+# 🚀 BOT START
 # =========================================================
 @client.event
 async def on_ready():
     await tree.sync()
     print(f"Bot läuft als {client.user}")
+
 
 client.run(TOKEN)
