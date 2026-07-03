@@ -538,7 +538,11 @@ def build_faction_table(stats):
         if len(top_players) > 24:
             top_players = top_players[:21] + "..."
 
-        top_text = f"{top_players} ({row['top_count']}x)" if top_players else "-"
+        # Top-Spieler nur anzeigen, wenn mindestens 2 Spiele mit diesem Volk vorhanden sind.
+        if row["top_count"] >= 2 and top_players:
+            top_text = f"{top_players} ({row['top_count']}x)"
+        else:
+            top_text = "-"
 
         lines.append(
             f"{faction:<16} {games:>6} {winrate:>8}  {top_text}"
