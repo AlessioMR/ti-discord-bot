@@ -4,6 +4,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from collections import Counter
 import os
+import json
 
 # =========================================================
 # 🔐 DISCORD TOKEN
@@ -15,8 +16,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # =========================================================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
+creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+
 creds = Credentials.from_service_account_file(
-    "service_account.json",
+    creds_json,
     scopes=SCOPES
 )
 
