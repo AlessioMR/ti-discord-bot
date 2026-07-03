@@ -51,17 +51,49 @@ tree.add_command(statistics)
 # =========================================================
 # 🧠 CONSTANTS / HELPERS
 # =========================================================
-KNOWN_FACTIONS = {
-    "arborec", "argent", "barony", "cabal", "creuss", "empyrean",
-    "hacan", "jol nar", "jolnar", "keleres", "l1", "letnev",
-    "mahact", "mentak", "muaat", "naalu", "naaz", "nekro",
-    "nomad", "saar", "sardakk", "sol", "titans", "winnu",
-    "xxcha", "yin", "yssaril",
+FACTION_CANONICAL = {
+    "arborec": "Arborec",
+    "argent": "Argent",
+    "barony": "Barony",
+    "cabal": "Cabal",
+    "creuss": "Creuss",
+    "empyrean": "Empyrean",
+    "hacan": "Hacan",
+    "jol nar": "Jol Nar",
+    "jolnar": "Jol Nar",
+    "keleres": "Keleres",
+    "l1": "L1",
+    "letnev": "Barony",
+    "mahact": "Mahact",
+    "mentak": "Mentak",
+    "muaat": "Muaat",
+    "naalu": "Naalu",
+    "naaz": "Naaz",
+    "nekro": "Nekro",
+    "nomad": "Nomad",
+    "saar": "Saar",
+    "sardakk": "Sardakk",
+    "sol": "Sol",
+    "titans": "Titans",
+    "winnu": "Winnu",
+    "xxcha": "Xxcha",
+    "yin": "Yin",
+    "yssaril": "Yssaril",
 
     # Custom / Homebrew / Varianten aus eurem Sheet
-    "dws", "crimson", "bastion", "obsidian", "ralnel",
-    "tf_orange", "tf_grün", "tf_lila", "tf_gelb", "tf_rot"
+    "dws": "DWS",
+    "crimson": "Crimson",
+    "bastion": "Bastion",
+    "obsidian": "Obsidian",
+    "ralnel": "Ralnel",
+    "tf_orange": "TF_Orange",
+    "tf_grün": "TF_Grün",
+    "tf_lila": "TF_Lila",
+    "tf_gelb": "TF_Gelb",
+    "tf_rot": "TF_Rot"
 }
+
+KNOWN_FACTIONS = set(FACTION_CANONICAL.keys())
 
 PLAYER_COLUMN_CANDIDATES = [
     "Spieler (VP, Volk)",
@@ -75,6 +107,17 @@ def normalize_name(name: str) -> str:
 
 def clean_text(value: str) -> str:
     return str(value).strip()
+
+
+def canonical_faction(faction: str) -> str:
+    faction = clean_text(faction)
+
+    if not faction:
+        return "Unbekannt"
+
+    key = faction.lower()
+
+    return FACTION_CANONICAL.get(key, faction)
 
 
 def parse_number(value):
@@ -153,7 +196,7 @@ def parse_player_entry(entry: str):
     {
         "name": "Chris",
         "vp": 10.0 oder None,
-        "faction": "Yssaril" oder None
+        "faction": "Yssaril" oder "Unbekannt"
     }
     """
     if not entry:
@@ -187,7 +230,6 @@ def parse_player_entry(entry: str):
         elif number is None and faction is None:
             faction = clean_text(part)
 
-    # Fallback: falls kein Volk erkannt wurde
     if not faction:
         faction = "Unbekannt"
 
@@ -199,6 +241,8 @@ def parse_player_entry(entry: str):
         and faction != "Unbekannt"
     ):
         name, faction = faction, name
+
+    faction = canonical_faction(faction)
 
     return {
         "name": name,
@@ -249,6 +293,12 @@ def format_count_sieg(count: int):
 
 def format_count_preis(count: int):
     return "1-facher Preisträger" if count == 1 else f"{count}-facher Preisträger"
+
+
+def format_winrate(wins: int, games: int):
+    if games == 0:
+        return "0.0%"
+    return f"{(wins / games) * 100:.1f}%"
 
 
 # =========================================================
@@ -401,6 +451,103 @@ def get_player_stats(name: str):
 
 
 # =========================================================
+# 🪐 FACTION STATS
+# =========================================================
+def get_faction_stats():
+    rows = get_rows()
+
+    faction_stats = {}
+
+    for row in rows:
+        players = parse_game_players(get_player_column(row))
+
+        if not players:
+            continue
+
+        winner_name = normalize_name(row.get("Gewinner", ""))
+
+        for player in players:
+            faction = player["faction"] or "Unbekannt"
+            player_name = player["name"]
+
+            if faction not in faction_stats:
+                faction_stats[faction] = {
+                    "games": 0,
+                    "wins": 0,
+                    "players": Counter()
+                }
+
+            faction_stats[faction]["games"] += 1
+            faction_stats[faction]["players"][player_name] += 1
+
+            if winner_name and normalize_name(player_name) == winner_name:
+                faction_stats[faction]["wins"] += 1
+
+    result = []
+
+    for faction, stats in faction_stats.items():
+        games = stats["games"]
+        wins = stats["wins"]
+        winrate = (wins / games * 100) if games else 0
+
+        top_count = 0
+        top_players = []
+
+        if stats["players"]:
+            top_count = max(stats["players"].values())
+            top_players = [
+                player
+                for player, count in stats["players"].items()
+                if count == top_count
+            ]
+
+        result.append({
+            "faction": faction,
+            "games": games,
+            "wins": wins,
+            "winrate": winrate,
+            "top_players": sorted(top_players),
+            "top_count": top_count
+        })
+
+    result.sort(
+        key=lambda x: (
+            x["games"],
+            x["winrate"],
+            x["faction"].lower()
+        ),
+        reverse=True
+    )
+
+    return result
+
+
+def build_faction_table(stats):
+    header = f"{'Volk':<16} {'Spiele':>6} {'Winrate':>8}  Top-Spieler"
+    divider = "-" * len(header)
+
+    lines = [header, divider]
+
+    for row in stats:
+        faction = row["faction"]
+        games = row["games"]
+        winrate = f"{row['winrate']:.1f}%"
+
+        top_players = ", ".join(row["top_players"])
+
+        if len(top_players) > 24:
+            top_players = top_players[:21] + "..."
+
+        top_text = f"{top_players} ({row['top_count']}x)" if top_players else "-"
+
+        lines.append(
+            f"{faction:<16} {games:>6} {winrate:>8}  {top_text}"
+        )
+
+    return "```text\n" + "\n".join(lines) + "\n```"
+
+
+# =========================================================
 # 🏆 /statistics halloffame
 # =========================================================
 @statistics.command(
@@ -549,6 +696,33 @@ async def player(interaction: discord.Interaction, name: str):
         name="Siege mit Völkern",
         value=faction_wins_text,
         inline=False
+    )
+
+    await interaction.followup.send(embed=embed)
+
+
+# =========================================================
+# 🪐 /statistics factions
+# =========================================================
+@statistics.command(
+    name="factions",
+    description="Zeigt Statistiken zu allen Völkern"
+)
+async def factions(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    stats = get_faction_stats()
+
+    table = build_faction_table(stats)
+
+    embed = discord.Embed(
+        title="Fraktionsstatistiken",
+        description=table,
+        color=0x9B59B6
+    )
+
+    embed.set_footer(
+        text="Sortiert nach Anzahl der Spiele. Winrate = Siege / Spiele."
     )
 
     await interaction.followup.send(embed=embed)
