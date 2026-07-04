@@ -2,9 +2,11 @@ import discord
 from discord import app_commands
 import gspread
 from gspread.exceptions import WorksheetNotFound
+from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 import os
 import json
 import re
@@ -61,6 +63,22 @@ tree.add_command(siegtabelle)
 # =========================================================
 # 🧠 CONSTANTS / HELPERS
 # =========================================================
+BOTDATA_HEADERS = [
+    "PlayerName",
+    "FactionName",
+    "FactionCategory",
+    "PointsValue",
+    "ExpansionValue",
+    "ModificationValue"
+]
+
+BOTDATA_COL_PLAYER = 1
+BOTDATA_COL_FACTION = 2
+BOTDATA_COL_FACTION_CATEGORY = 3
+BOTDATA_COL_POINTS = 4
+BOTDATA_COL_EXPANSION = 5
+BOTDATA_COL_MODIFICATION = 6
+
 FACTION_CATEGORY_STANDARD_A_M = "standard_a_m"
 FACTION_CATEGORY_STANDARD_N_Z = "standard_n_z"
 FACTION_CATEGORY_TWILIGHTS_FALL = "twilights_fall"
@@ -168,6 +186,28 @@ STANDARD_FACTIONS_ALL = (
 
 KNOWN_FACTIONS = set(FACTION_CANONICAL.keys())
 
+DEFAULT_POINTS = [
+    "10",
+    "12",
+    "14"
+]
+
+DEFAULT_EXPANSIONS = [
+    "Basis",
+    "PoK",
+    "PoK + TE"
+]
+
+DEFAULT_MODIFICATIONS = [
+    "Nein",
+    "Hidden Agenda",
+    "Twilights Fall",
+    "Absols Agendas, Minor Factions",
+    "Cosmic Phenomenae",
+    "4/4/4",
+    "Total War"
+]
+
 PLAYER_COLUMN_CANDIDATES = [
     "Spieler (VP, Volk)",
     "Spieler (Volk, VP)"
@@ -190,6 +230,25 @@ def normalize_name(name: str) -> str:
 
 def clean_text(value: str) -> str:
     return str(value).strip()
+
+
+def unique_preserve_order(values):
+    result = []
+    seen = set()
+
+    for value in values:
+        value = clean_text(value)
+
+        if not value:
+            continue
+
+        key = normalize_name(value)
+
+        if key not in seen:
+            result.append(value)
+            seen.add(key)
+
+    return result
 
 
 def canonical_faction(faction: str) -> str:
@@ -228,6 +287,18 @@ def format_number_for_sheet(value):
     return str(value).replace(".", ",")
 
 
+def normalize_date_input(value: str):
+    text = clean_text(value)
+
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            pass
+
+    return None
+
+
 def get_rows():
     return sheet.get_all_records()
 
@@ -237,6 +308,18 @@ def get_player_column(row):
         if column_name in row and row.get(column_name):
             return row.get(column_name)
     return ""
+
+
+def get_unique_sheet_column_values(column_name):
+    values = []
+
+    for row in get_rows():
+        value = clean_text(row.get(column_name, ""))
+
+        if value:
+            values.append(value)
+
+    return unique_preserve_order(values)
 
 
 def split_community_names(entry: str):
@@ -337,30 +420,34 @@ def get_botdata_sheet(create=False):
         botdata = spreadsheet.add_worksheet(
             title=BOTDATA_SHEET_NAME,
             rows=500,
-            cols=3
+            cols=6
         )
 
     botdata.update(
-        "A1:C1",
-        [["PlayerName", "FactionName", "FactionCategory"]]
+        "A1:F1",
+        [BOTDATA_HEADERS]
     )
 
     return botdata
 
 
-def get_botdata_players():
+def get_botdata_column_values(column_index):
     botdata = get_botdata_sheet(create=False)
 
     if botdata is None:
         return []
 
-    values = botdata.col_values(1)
+    values = botdata.col_values(column_index)
 
     return [
         value.strip()
         for value in values[1:]
         if value.strip()
     ]
+
+
+def get_botdata_players():
+    return get_botdata_column_values(BOTDATA_COL_PLAYER)
 
 
 def get_botdata_faction_records():
@@ -403,7 +490,7 @@ def add_botdata_player(name: str):
         return False, f"**{name}** existiert bereits."
 
     botdata = get_botdata_sheet(create=True)
-    botdata.append_row([name, "", ""], value_input_option="USER_ENTERED")
+    botdata.append_row([name, "", "", "", "", ""], value_input_option="USER_ENTERED")
 
     _player_name_cache["timestamp"] = 0
 
@@ -422,11 +509,90 @@ def add_botdata_faction(name: str, category: str):
         return False, f"Volk **{name}** existiert bereits."
 
     botdata = get_botdata_sheet(create=True)
-    botdata.append_row(["", name, category], value_input_option="USER_ENTERED")
+    botdata.append_row(["", name, category, "", "", ""], value_input_option="USER_ENTERED")
 
     _faction_name_cache["timestamp"] = 0
 
     return True, f"Volk **{name}** wurde hinzugefügt."
+
+
+def add_botdata_setting(column_index: int, value: str):
+    value = clean_text(value)
+
+    if not value:
+        return False, "Leerer Eintrag."
+
+    botdata = get_botdata_sheet(create=True)
+
+    existing = get_botdata_column_values(column_index)
+
+    if normalize_name(value) in [normalize_name(v) for v in existing]:
+        return False, f"**{value}** existiert bereits."
+
+    row = ["", "", "", "", "", ""]
+    row[column_index - 1] = value
+
+    botdata.append_row(row, value_input_option="USER_ENTERED")
+
+    return True, f"**{value}** wurde hinzugefügt."
+
+
+def add_botdata_points(value: str):
+    number = parse_number(value)
+
+    if number is None:
+        return False, "Punkte müssen eine Zahl sein."
+
+    value = format_number_for_sheet(number)
+
+    existing = get_points_options()
+
+    if normalize_name(value) in [normalize_name(v) for v in existing]:
+        return False, f"**{value}** existiert bereits."
+
+    return add_botdata_setting(BOTDATA_COL_POINTS, value)
+
+
+def add_botdata_expansion(value: str):
+    existing = get_expansion_options()
+
+    if normalize_name(value) in [normalize_name(v) for v in existing]:
+        return False, f"**{value}** existiert bereits."
+
+    return add_botdata_setting(BOTDATA_COL_EXPANSION, value)
+
+
+def add_botdata_modification(value: str):
+    existing = get_modification_options()
+
+    if normalize_name(value) in [normalize_name(v) for v in existing]:
+        return False, f"**{value}** existiert bereits."
+
+    return add_botdata_setting(BOTDATA_COL_MODIFICATION, value)
+
+
+def get_points_options():
+    return unique_preserve_order(
+        DEFAULT_POINTS
+        + get_unique_sheet_column_values("Punkte")
+        + get_botdata_column_values(BOTDATA_COL_POINTS)
+    )
+
+
+def get_expansion_options():
+    return unique_preserve_order(
+        DEFAULT_EXPANSIONS
+        + get_unique_sheet_column_values("Erweiterung")
+        + get_botdata_column_values(BOTDATA_COL_EXPANSION)
+    )
+
+
+def get_modification_options():
+    return unique_preserve_order(
+        DEFAULT_MODIFICATIONS
+        + get_unique_sheet_column_values("Modifikation")
+        + get_botdata_column_values(BOTDATA_COL_MODIFICATION)
+    )
 
 
 def get_all_player_names_cached(force_refresh=False):
@@ -528,6 +694,43 @@ def get_factions_for_category(category: str):
     return result
 
 
+def build_select_options_with_add_first(values, selected_value, add_label):
+    options = [
+        discord.SelectOption(
+            label=add_label,
+            value="__add__"
+        )
+    ]
+
+    visible_values = []
+    seen = set()
+
+    if selected_value:
+        visible_values.append(selected_value)
+        seen.add(normalize_name(selected_value))
+
+    for value in values:
+        key = normalize_name(value)
+
+        if key not in seen:
+            visible_values.append(value)
+            seen.add(key)
+
+        if len(visible_values) >= 24:
+            break
+
+    for value in visible_values:
+        options.append(
+            discord.SelectOption(
+                label=value,
+                value=value,
+                default=selected_value == value
+            )
+        )
+
+    return options[:25]
+
+
 async def player_name_autocomplete(
     interaction: discord.Interaction,
     current: str
@@ -577,6 +780,18 @@ def format_winrate(wins: int, games: int):
     if games == 0:
         return "0.0%"
     return f"{(wins / games) * 100:.1f}%"
+
+
+def get_next_available_sheet_row():
+    all_values = sheet.get_all_values()
+
+    last_non_empty_row = 1
+
+    for index, row in enumerate(all_values, start=1):
+        if any(str(cell).strip() for cell in row):
+            last_non_empty_row = index
+
+    return max(last_non_empty_row + 1, 2)
 
 
 # =========================================================
@@ -1000,7 +1215,14 @@ def append_game_to_sheet(state: AddGameState):
         for header in headers
     ]
 
-    sheet.append_row(row, value_input_option="USER_ENTERED")
+    next_row = get_next_available_sheet_row()
+    end_cell = rowcol_to_a1(next_row, len(headers))
+
+    sheet.update(
+        f"A{next_row}:{end_cell}",
+        [row],
+        value_input_option="USER_ENTERED"
+    )
 
     _player_name_cache["timestamp"] = 0
     _faction_name_cache["timestamp"] = 0
@@ -1025,33 +1247,12 @@ class OwnerOnlyView(discord.ui.View):
         return True
 
 
-class BasicGameModal(discord.ui.Modal, title="Neues Spiel - Grunddaten"):
+class BasicGameModal(discord.ui.Modal, title="Neues Spiel - Datum"):
     datum = discord.ui.TextInput(
         label="Datum",
-        placeholder="z.B. 14.06.2026",
+        placeholder="TT.MM.JJJJ, z.B. 14.06.2026",
         required=True,
         max_length=20
-    )
-
-    punkte = discord.ui.TextInput(
-        label="Punkte",
-        placeholder="z.B. 10, 12 oder 14",
-        required=True,
-        max_length=10
-    )
-
-    erweiterung = discord.ui.TextInput(
-        label="Erweiterung",
-        placeholder="z.B. Basis, PoK, PoK + TE",
-        required=True,
-        max_length=50
-    )
-
-    modifikation = discord.ui.TextInput(
-        label="Modifikation",
-        placeholder="z.B. Nein, Hidden Agenda, Total War",
-        required=True,
-        max_length=100
     )
 
     kommentare = discord.ui.TextInput(
@@ -1067,19 +1268,235 @@ class BasicGameModal(discord.ui.Modal, title="Neues Spiel - Grunddaten"):
         self.state = state
 
     async def on_submit(self, interaction: discord.Interaction):
-        self.state.datum = str(self.datum.value).strip()
-        self.state.punkte = str(self.punkte.value).strip()
-        self.state.erweiterung = str(self.erweiterung.value).strip()
-        self.state.modifikation = str(self.modifikation.value).strip()
+        normalized_date = normalize_date_input(str(self.datum.value))
+
+        if not normalized_date:
+            await interaction.response.send_message(
+                "Ungültiges Datum. Bitte nutze das Format `TT.MM.JJJJ`, z.B. `14.06.2026`.",
+                ephemeral=True
+            )
+            return
+
+        self.state.datum = normalized_date
         self.state.kommentare = str(self.kommentare.value).strip()
+
+        view = GameSettingsSelectionView(self.state)
+
+        await interaction.response.send_message(
+            "Schritt 1: Wähle Punkte, Erweiterung und Modifikation.",
+            view=view,
+            ephemeral=True
+        )
+
+
+class PointsSelect(discord.ui.Select):
+    def __init__(self, state: AddGameState):
+        self.state = state
+
+        options = build_select_options_with_add_first(
+            get_points_options(),
+            state.punkte,
+            "Neue Punkte eintragen"
+        )
+
+        super().__init__(
+            placeholder="Punkte auswählen",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+
+        if value == "__add__":
+            await interaction.response.send_modal(
+                CustomSettingModal(self.state, "points")
+            )
+            return
+
+        self.state.punkte = value
+
+        await interaction.response.edit_message(
+            content="Schritt 1: Wähle Punkte, Erweiterung und Modifikation.",
+            view=GameSettingsSelectionView(self.state)
+        )
+
+
+class ExpansionSelect(discord.ui.Select):
+    def __init__(self, state: AddGameState):
+        self.state = state
+
+        options = build_select_options_with_add_first(
+            get_expansion_options(),
+            state.erweiterung,
+            "Neue Erweiterung eintragen"
+        )
+
+        super().__init__(
+            placeholder="Erweiterung auswählen",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+
+        if value == "__add__":
+            await interaction.response.send_modal(
+                CustomSettingModal(self.state, "expansion")
+            )
+            return
+
+        self.state.erweiterung = value
+
+        await interaction.response.edit_message(
+            content="Schritt 1: Wähle Punkte, Erweiterung und Modifikation.",
+            view=GameSettingsSelectionView(self.state)
+        )
+
+
+class ModificationSelect(discord.ui.Select):
+    def __init__(self, state: AddGameState):
+        self.state = state
+
+        options = build_select_options_with_add_first(
+            get_modification_options(),
+            state.modifikation,
+            "Neue Modifikation eintragen"
+        )
+
+        super().__init__(
+            placeholder="Modifikation auswählen",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+
+        if value == "__add__":
+            await interaction.response.send_modal(
+                CustomSettingModal(self.state, "modification")
+            )
+            return
+
+        self.state.modifikation = value
+
+        await interaction.response.edit_message(
+            content="Schritt 1: Wähle Punkte, Erweiterung und Modifikation.",
+            view=GameSettingsSelectionView(self.state)
+        )
+
+
+class CustomSettingModal(discord.ui.Modal):
+    value = discord.ui.TextInput(
+        label="Neuer Eintrag",
+        placeholder="Neuen Wert eintragen",
+        required=True,
+        max_length=100
+    )
+
+    def __init__(self, state: AddGameState, setting_type: str):
+        title_map = {
+            "points": "Neue Punkte eintragen",
+            "expansion": "Neue Erweiterung eintragen",
+            "modification": "Neue Modifikation eintragen"
+        }
+
+        super().__init__(title=title_map.get(setting_type, "Neuer Eintrag"))
+
+        self.state = state
+        self.setting_type = setting_type
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = clean_text(str(self.value.value))
+
+        if not value:
+            await interaction.response.send_message(
+                "Leerer Eintrag.",
+                ephemeral=True
+            )
+            return
+
+        if self.setting_type == "points":
+            number = parse_number(value)
+
+            if number is None:
+                await interaction.response.send_message(
+                    "Punkte müssen eine Zahl sein.",
+                    ephemeral=True
+                )
+                return
+
+            value = format_number_for_sheet(number)
+            add_botdata_points(value)
+            self.state.punkte = value
+            label = "Punkte"
+
+        elif self.setting_type == "expansion":
+            add_botdata_expansion(value)
+            self.state.erweiterung = value
+            label = "Erweiterung"
+
+        else:
+            add_botdata_modification(value)
+            self.state.modifikation = value
+            label = "Modifikation"
+
+        await interaction.response.send_message(
+            f"{label} **{value}** wurde gesetzt.\n\nSchritt 1: Prüfe die Auswahl und klicke auf Weiter.",
+            view=GameSettingsSelectionView(self.state),
+            ephemeral=True
+        )
+
+
+class GameSettingsSelectionView(OwnerOnlyView):
+    def __init__(self, state: AddGameState):
+        super().__init__(state)
+
+        self.add_item(PointsSelect(state))
+        self.add_item(ExpansionSelect(state))
+        self.add_item(ModificationSelect(state))
+
+    @discord.ui.button(
+        label="Weiter",
+        style=discord.ButtonStyle.primary
+    )
+    async def next_step(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not self.state.punkte:
+            await interaction.response.send_message(
+                "Bitte Punkte auswählen.",
+                ephemeral=True
+            )
+            return
+
+        if not self.state.erweiterung:
+            await interaction.response.send_message(
+                "Bitte Erweiterung auswählen.",
+                ephemeral=True
+            )
+            return
+
+        if not self.state.modifikation:
+            await interaction.response.send_message(
+                "Bitte Modifikation auswählen.",
+                ephemeral=True
+            )
+            return
 
         player_names = get_all_player_names_cached()
         view = PlayerAsyncSelectionView(self.state, player_names)
 
-        await interaction.response.send_message(
-            "Schritt 2: Wähle ASYNC und bis zu 8 Spieler aus. Falls ein Name fehlt, wähle 'Neuen Spieler eintragen'.",
-            view=view,
-            ephemeral=True
+        await interaction.response.edit_message(
+            content="Schritt 2: Wähle ASYNC und bis zu 8 Spieler aus. Falls ein Name fehlt, wähle 'Neuen Spieler eintragen'.",
+            view=view
         )
 
 
@@ -1135,25 +1552,25 @@ class ParticipantSelect(discord.ui.Select):
 
         options = [
             discord.SelectOption(
+                label="Neuen Spieler eintragen",
+                value="__add_player__"
+            )
+        ]
+
+        options.extend([
+            discord.SelectOption(
                 label=name,
                 value=name,
                 default=name in state.participants
             )
             for name in visible_names
-        ]
-
-        options.append(
-            discord.SelectOption(
-                label="Neuen Spieler eintragen",
-                value="__add_player__"
-            )
-        )
+        ])
 
         super().__init__(
             placeholder="Spieler auswählen, maximal 8",
             min_values=1,
             max_values=min(8, len(options)),
-            options=options
+            options=options[:25]
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1501,7 +1918,12 @@ class FactionSelect(discord.ui.Select):
         faction_names = get_factions_for_category(category)
         visible_factions = faction_names[:24]
 
-        options = []
+        options = [
+            discord.SelectOption(
+                label="Neues Volk eintragen",
+                value="__custom__"
+            )
+        ]
 
         for faction in visible_factions:
             options.append(
@@ -1511,13 +1933,6 @@ class FactionSelect(discord.ui.Select):
                     default=detail["faction"] == faction
                 )
             )
-
-        options.append(
-            discord.SelectOption(
-                label="Neues Volk eintragen",
-                value="__custom__"
-            )
-        )
 
         super().__init__(
             placeholder="Volk auswählen",
