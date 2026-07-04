@@ -3,6 +3,7 @@ from discord import app_commands
 import gspread
 from google.oauth2.service_account import Credentials
 from collections import Counter
+from dataclasses import dataclass, field
 import os
 import json
 import re
@@ -16,7 +17,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # =========================================================
 # 📊 GOOGLE SHEETS SETUP
 # =========================================================
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
 
@@ -47,7 +48,13 @@ statistics = app_commands.Group(
     description="Twilight Imperium Statistiken"
 )
 
+siegtabelle = app_commands.Group(
+    name="siegtabelle",
+    description="Siegtabelle verwalten"
+)
+
 tree.add_command(statistics)
+tree.add_command(siegtabelle)
 
 # =========================================================
 # 🧠 CONSTANTS / HELPERS
@@ -101,6 +108,8 @@ PLAYER_COLUMN_CANDIDATES = [
     "Spieler (Volk, VP)"
 ]
 
+PLAYER_DETAIL_CHUNK_SIZE = 4
+
 _player_name_cache = {
     "timestamp": 0,
     "names": []
@@ -141,6 +150,16 @@ def parse_number(value):
         return None
 
 
+def format_number_for_sheet(value):
+    if value is None:
+        return ""
+
+    if float(value).is_integer():
+        return str(int(value))
+
+    return str(value).replace(".", ",")
+
+
 def get_rows():
     return sheet.get_all_records()
 
@@ -164,18 +183,6 @@ def split_community_names(entry: str):
 
 
 def split_game_entries(raw: str):
-    """
-    Trennt eine komplette Spieler-Zelle in einzelne Spieler-Einträge.
-
-    Beispiel:
-    "1. Chris (10, Yssaril), 2. Timo (9, Hacan)"
-
-    wird zu:
-    [
-        "Chris (10, Yssaril)",
-        "Timo (9, Hacan)"
-    ]
-    """
     if not raw:
         return []
 
@@ -190,21 +197,6 @@ def split_game_entries(raw: str):
 
 
 def parse_player_entry(entry: str):
-    """
-    Unterstützt:
-    - Chris (10, Yssaril)
-    - Chris (Yssaril, 10)
-    - Alessio (, Saar)
-    - Alessio (12, Nekro,)
-    - 4.Yogi (6, Nekro)
-
-    Gibt zurück:
-    {
-        "name": "Chris",
-        "vp": 10.0 oder None,
-        "faction": "Yssaril" oder "Unbekannt"
-    }
-    """
     if not entry:
         return None
 
@@ -239,8 +231,6 @@ def parse_player_entry(entry: str):
     if not faction:
         faction = "Unbekannt"
 
-    # Autokorrektur für Fälle wie:
-    # "Keleres (11, Malte)" -> eigentlich "Malte (11, Keleres)"
     if (
         normalize_name(name) in KNOWN_FACTIONS
         and normalize_name(faction) not in KNOWN_FACTIONS
@@ -270,10 +260,6 @@ def parse_game_players(raw: str):
 
 
 def get_all_player_names_cached():
-    """
-    Holt alle bekannten Spielernamen für Discord Autocomplete.
-    Cache verhindert, dass bei jedem Tastendruck Google Sheets neu abgefragt wird.
-    """
     now = time.time()
 
     if now - _player_name_cache["timestamp"] < 300 and _player_name_cache["names"]:
@@ -324,14 +310,6 @@ async def player_name_autocomplete(
 
 
 def get_target_points(row, players):
-    """
-    Normalisierung auf 10 Punkte.
-
-    Priorität:
-    1. Spalte "Punkte", falls vorhanden
-    2. VP des Gewinners
-    3. None, wenn nicht zuverlässig bestimmbar
-    """
     points_from_sheet = parse_number(row.get("Punkte"))
 
     if points_from_sheet and points_from_sheet > 0:
@@ -449,12 +427,9 @@ def get_player_stats(name: str):
 
         winner_name = normalize_name(row.get("Gewinner", ""))
 
-        # Siege sollen mit Hall of Fame übereinstimmen:
-        # Quelle ist immer die Gewinner-Spalte.
         if winner_name == search_name:
             wins += 1
 
-        # Community Preis unabhängig von Spielereintrag zählen
         for community_name in split_community_names(row.get("Community Preis")):
             if normalize_name(community_name) == search_name:
                 community_awards += 1
@@ -598,7 +573,6 @@ def build_faction_table(stats):
         if len(top_players) > 24:
             top_players = top_players[:21] + "..."
 
-        # Top-Spieler nur anzeigen, wenn mindestens 2 Spiele mit diesem Volk vorhanden sind.
         if row["top_count"] >= 2 and top_players:
             top_text = f"{top_players} ({row['top_count']}x)"
         else:
@@ -609,6 +583,550 @@ def build_faction_table(stats):
         )
 
     return "```text\n" + "\n".join(lines) + "\n```"
+
+
+# =========================================================
+# 📝 SIEGTABELLE ADD GAME STATE / HELPERS
+# =========================================================
+@dataclass
+class AddGameState:
+    owner_id: int
+    datum: str = ""
+    punkte: str = ""
+    erweiterung: str = ""
+    modifikation: str = ""
+    kommentare: str = ""
+    async_value: str = ""
+    participants: list = field(default_factory=list)
+    winner: str = ""
+    winner_selected: bool = False
+    community_awards: list = field(default_factory=list)
+    player_details: dict = field(default_factory=dict)
+
+
+def parse_vp_faction_input(value: str):
+    text = str(value).strip()
+
+    if not text:
+        return None, "Unbekannt"
+
+    if ";" in text:
+        parts = [p.strip() for p in text.split(";")]
+    else:
+        parts = [p.strip() for p in text.split(",")]
+
+    parts = [p for p in parts if p != ""]
+
+    vp = None
+    faction = None
+
+    for part in parts:
+        number = parse_number(part)
+
+        if number is not None and vp is None:
+            vp = number
+        elif number is None and faction is None:
+            faction = part
+
+    if not faction:
+        faction = "Unbekannt"
+
+    return vp, canonical_faction(faction)
+
+
+def build_player_cell_from_state(state: AddGameState):
+    rows = []
+
+    for index, player_name in enumerate(state.participants):
+        detail = state.player_details.get(player_name, {})
+        rows.append({
+            "name": player_name,
+            "vp": detail.get("vp"),
+            "faction": detail.get("faction", "Unbekannt"),
+            "original_index": index
+        })
+
+    has_any_vp = any(row["vp"] is not None for row in rows)
+
+    if has_any_vp:
+        rows.sort(
+            key=lambda row: (
+                row["vp"] is None,
+                -(row["vp"] if row["vp"] is not None else -999),
+                row["original_index"]
+            )
+        )
+    else:
+        rows.sort(key=lambda row: row["original_index"])
+
+    entries = []
+    last_vp = object()
+    rank = 0
+    position = 0
+
+    for row in rows:
+        position += 1
+        current_vp = row["vp"]
+
+        if current_vp is None:
+            rank = position
+        elif current_vp != last_vp:
+            rank = position
+
+        last_vp = current_vp
+
+        vp_text = format_number_for_sheet(current_vp)
+        entries.append(
+            f"{rank}. {row['name']} ({vp_text}, {row['faction']})"
+        )
+
+    return ", ".join(entries)
+
+
+def build_preview_embed(state: AddGameState):
+    player_cell = build_player_cell_from_state(state)
+
+    winner_text = state.winner if state.winner else "Kein Gewinner / abgebrochen"
+    community_text = ", ".join(state.community_awards) if state.community_awards else "-"
+
+    embed = discord.Embed(
+        title="Vorschau: Neues Spiel",
+        color=0x2ECC71
+    )
+
+    embed.add_field(
+        name="Grunddaten",
+        value=(
+            f"Datum: **{state.datum}**\n"
+            f"Punkte: **{state.punkte}**\n"
+            f"Erweiterung: **{state.erweiterung}**\n"
+            f"Modifikation: **{state.modifikation}**\n"
+            f"ASYNC: **{state.async_value}**"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Ergebnis",
+        value=(
+            f"Gewinner: **{winner_text}**\n"
+            f"Community Preis: **{community_text}**"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Spieler",
+        value=player_cell if player_cell else "-",
+        inline=False
+    )
+
+    if state.kommentare:
+        embed.add_field(
+            name="Kommentare",
+            value=state.kommentare,
+            inline=False
+        )
+
+    return embed
+
+
+def append_game_to_sheet(state: AddGameState):
+    player_cell = build_player_cell_from_state(state)
+    community_cell = ", ".join(state.community_awards)
+    winner_cell = state.winner if state.winner else ""
+
+    row_data = {
+        "Datum": state.datum,
+        "Punkte": state.punkte,
+        "Erweiterung": state.erweiterung,
+        "Modifikation": state.modifikation,
+        "Gewinner": winner_cell,
+        "Spieler (VP, Volk)": player_cell,
+        "Spieler (Volk, VP)": player_cell,
+        "Community Preis": community_cell,
+        "ASYNC": state.async_value,
+        "Kommentare": state.kommentare
+    }
+
+    headers = sheet.row_values(1)
+
+    row = [
+        row_data.get(header, "")
+        for header in headers
+    ]
+
+    sheet.append_row(row, value_input_option="USER_ENTERED")
+
+    _player_name_cache["timestamp"] = 0
+
+
+# =========================================================
+# 📝 SIEGTABELLE UI
+# =========================================================
+class OwnerOnlyView(discord.ui.View):
+    def __init__(self, state: AddGameState, timeout=300):
+        super().__init__(timeout=timeout)
+        self.state = state
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.state.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Wizard gestartet hat, kann diese Auswahl benutzen.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+
+class BasicGameModal(discord.ui.Modal, title="Neues Spiel - Grunddaten"):
+    datum = discord.ui.TextInput(
+        label="Datum",
+        placeholder="z.B. 14.06.2026",
+        required=True,
+        max_length=20
+    )
+
+    punkte = discord.ui.TextInput(
+        label="Punkte",
+        placeholder="z.B. 10, 12 oder 14",
+        required=True,
+        max_length=10
+    )
+
+    erweiterung = discord.ui.TextInput(
+        label="Erweiterung",
+        placeholder="z.B. Basis, PoK, PoK + TE",
+        required=True,
+        max_length=50
+    )
+
+    modifikation = discord.ui.TextInput(
+        label="Modifikation",
+        placeholder="z.B. Nein, Hidden Agenda, Total War",
+        required=True,
+        max_length=100
+    )
+
+    kommentare = discord.ui.TextInput(
+        label="Kommentare",
+        placeholder="Optional",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=500
+    )
+
+    def __init__(self, state: AddGameState):
+        super().__init__()
+        self.state = state
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.state.datum = str(self.datum.value).strip()
+        self.state.punkte = str(self.punkte.value).strip()
+        self.state.erweiterung = str(self.erweiterung.value).strip()
+        self.state.modifikation = str(self.modifikation.value).strip()
+        self.state.kommentare = str(self.kommentare.value).strip()
+
+        player_names = get_all_player_names_cached()
+
+        if not player_names:
+            await interaction.response.send_message(
+                "Keine bekannten Spielernamen im Sheet gefunden.",
+                ephemeral=True
+            )
+            return
+
+        view = PlayerAsyncSelectionView(self.state, player_names)
+
+        await interaction.response.send_message(
+            "Schritt 2: Wähle ASYNC und bis zu 8 Spieler aus.",
+            view=view,
+            ephemeral=True
+        )
+
+
+class AsyncSelect(discord.ui.Select):
+    def __init__(self, state: AddGameState):
+        self.state = state
+
+        options = [
+            discord.SelectOption(label="Nein", value="n"),
+            discord.SelectOption(label="Ja", value="y")
+        ]
+
+        super().__init__(
+            placeholder="ASYNC auswählen",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.state.async_value = self.values[0]
+        await interaction.response.defer()
+
+
+class ParticipantSelect(discord.ui.Select):
+    def __init__(self, state: AddGameState, player_names):
+        self.state = state
+
+        names = player_names[:25]
+
+        options = [
+            discord.SelectOption(label=name, value=name)
+            for name in names
+        ]
+
+        super().__init__(
+            placeholder="Spieler auswählen, maximal 8",
+            min_values=1,
+            max_values=min(8, len(options)),
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.state.participants = list(self.values)
+        await interaction.response.defer()
+
+
+class PlayerAsyncSelectionView(OwnerOnlyView):
+    def __init__(self, state: AddGameState, player_names):
+        super().__init__(state)
+
+        self.add_item(AsyncSelect(state))
+        self.add_item(ParticipantSelect(state, player_names))
+
+    @discord.ui.button(
+        label="Weiter",
+        style=discord.ButtonStyle.primary
+    )
+    async def next_step(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not self.state.async_value:
+            await interaction.response.send_message(
+                "Bitte ASYNC auswählen.",
+                ephemeral=True
+            )
+            return
+
+        if not self.state.participants:
+            await interaction.response.send_message(
+                "Bitte mindestens einen Spieler auswählen.",
+                ephemeral=True
+            )
+            return
+
+        view = WinnerCommunitySelectionView(self.state)
+
+        await interaction.response.edit_message(
+            content="Schritt 3: Wähle Gewinner und Community Preis.",
+            view=view
+        )
+
+
+class WinnerSelect(discord.ui.Select):
+    def __init__(self, state: AddGameState):
+        self.state = state
+
+        options = [
+            discord.SelectOption(
+                label="Kein Gewinner / abgebrochen",
+                value="__none__"
+            )
+        ]
+
+        options.extend([
+            discord.SelectOption(label=name, value=name)
+            for name in state.participants
+        ])
+
+        super().__init__(
+            placeholder="Gewinner auswählen",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+
+        if value == "__none__":
+            self.state.winner = ""
+        else:
+            self.state.winner = value
+
+        self.state.winner_selected = True
+
+        await interaction.response.defer()
+
+
+class CommunitySelect(discord.ui.Select):
+    def __init__(self, state: AddGameState):
+        self.state = state
+
+        options = [
+            discord.SelectOption(
+                label="Kein Community Preis",
+                value="__none__"
+            )
+        ]
+
+        options.extend([
+            discord.SelectOption(label=name, value=name)
+            for name in state.participants
+        ])
+
+        super().__init__(
+            placeholder="Community Preis auswählen",
+            min_values=1,
+            max_values=len(options),
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if "__none__" in self.values:
+            self.state.community_awards = []
+        else:
+            self.state.community_awards = list(self.values)
+
+        await interaction.response.defer()
+
+
+class WinnerCommunitySelectionView(OwnerOnlyView):
+    def __init__(self, state: AddGameState):
+        super().__init__(state)
+
+        self.add_item(WinnerSelect(state))
+        self.add_item(CommunitySelect(state))
+
+    @discord.ui.button(
+        label="Weiter zu VP & Völkern",
+        style=discord.ButtonStyle.primary
+    )
+    async def next_step(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not self.state.winner_selected:
+            await interaction.response.send_message(
+                "Bitte einen Gewinner oder 'Kein Gewinner / abgebrochen' auswählen.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(
+            PlayerDetailsModal(self.state, start_index=0)
+        )
+
+
+class PlayerDetailsModal(discord.ui.Modal):
+    def __init__(self, state: AddGameState, start_index: int):
+        super().__init__(title="VP und Völker")
+        self.state = state
+        self.start_index = start_index
+        self.inputs = []
+
+        selected_players = state.participants[
+            start_index:start_index + PLAYER_DETAIL_CHUNK_SIZE
+        ]
+
+        for player_name in selected_players:
+            label = f"{player_name}: VP; Volk"
+
+            if len(label) > 45:
+                label = label[:42] + "..."
+
+            text_input = discord.ui.TextInput(
+                label=label,
+                placeholder="z.B. 10; Saar oder ; Saar",
+                required=True,
+                max_length=100
+            )
+
+            self.add_item(text_input)
+            self.inputs.append((player_name, text_input))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        for player_name, text_input in self.inputs:
+            vp, faction = parse_vp_faction_input(str(text_input.value))
+
+            self.state.player_details[player_name] = {
+                "vp": vp,
+                "faction": faction
+            }
+
+        next_index = self.start_index + PLAYER_DETAIL_CHUNK_SIZE
+
+        if next_index < len(self.state.participants):
+            await interaction.response.send_modal(
+                PlayerDetailsModal(self.state, start_index=next_index)
+            )
+            return
+
+        embed = build_preview_embed(self.state)
+        view = ConfirmGameView(self.state)
+
+        await interaction.response.send_message(
+            "Schritt 5: Bitte prüfe die Vorschau.",
+            embed=embed,
+            view=view,
+            ephemeral=True
+        )
+
+
+class ConfirmGameView(OwnerOnlyView):
+    def __init__(self, state: AddGameState):
+        super().__init__(state)
+
+    @discord.ui.button(
+        label="In Sheet eintragen",
+        style=discord.ButtonStyle.success
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            append_game_to_sheet(self.state)
+        except Exception as e:
+            await interaction.followup.send(
+                f"Fehler beim Schreiben ins Google Sheet:\n```text\n{e}\n```",
+                ephemeral=True
+            )
+            return
+
+        embed = build_preview_embed(self.state)
+        embed.title = "Spiel wurde eingetragen"
+        embed.color = 0x2ECC71
+
+        await interaction.edit_original_response(
+            content="Das Spiel wurde erfolgreich in die Siegtabelle eingetragen.",
+            embed=embed,
+            view=None
+        )
+
+    @discord.ui.button(
+        label="Abbrechen",
+        style=discord.ButtonStyle.danger
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Vorgang abgebrochen. Es wurde nichts ins Sheet geschrieben.",
+            embed=None,
+            view=None
+        )
 
 
 # =========================================================
@@ -788,6 +1306,21 @@ async def factions(interaction: discord.Interaction):
     )
 
     await interaction.followup.send(embed=embed)
+
+
+# =========================================================
+# 📝 /siegtabelle add_game
+# =========================================================
+@siegtabelle.command(
+    name="add_game",
+    description="Fügt ein neues Spiel zur Siegtabelle hinzu"
+)
+async def add_game(interaction: discord.Interaction):
+    state = AddGameState(owner_id=interaction.user.id)
+
+    await interaction.response.send_modal(
+        BasicGameModal(state)
+    )
 
 
 # =========================================================
