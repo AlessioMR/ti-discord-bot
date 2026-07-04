@@ -595,6 +595,22 @@ def get_modification_options():
     )
 
 
+def clean_selected_modifications(values):
+    cleaned = unique_preserve_order(values)
+
+    if len(cleaned) > 1:
+        cleaned = [
+            value for value in cleaned
+            if normalize_name(value) != "nein"
+        ]
+
+    return cleaned
+
+
+def format_modifications_for_sheet(state):
+    return " + ".join(state.modifikationen)
+
+
 def get_all_player_names_cached(force_refresh=False):
     now = time.time()
 
@@ -725,6 +741,49 @@ def build_select_options_with_add_first(values, selected_value, add_label):
                 label=value,
                 value=value,
                 default=selected_value == value
+            )
+        )
+
+    return options[:25]
+
+
+def build_multi_select_options_with_add_first(values, selected_values, add_label):
+    selected_values = selected_values or []
+    selected_keys = {normalize_name(value) for value in selected_values}
+
+    options = [
+        discord.SelectOption(
+            label=add_label,
+            value="__add__"
+        )
+    ]
+
+    visible_values = []
+    seen = set()
+
+    for value in selected_values:
+        key = normalize_name(value)
+
+        if key not in seen:
+            visible_values.append(value)
+            seen.add(key)
+
+    for value in values:
+        key = normalize_name(value)
+
+        if key not in seen:
+            visible_values.append(value)
+            seen.add(key)
+
+        if len(visible_values) >= 24:
+            break
+
+    for value in visible_values:
+        options.append(
+            discord.SelectOption(
+                label=value,
+                value=value,
+                default=normalize_name(value) in selected_keys
             )
         )
 
@@ -1049,7 +1108,7 @@ class AddGameState:
     datum: str = ""
     punkte: str = ""
     erweiterung: str = ""
-    modifikation: str = ""
+    modifikationen: list = field(default_factory=list)
     kommentare: str = ""
     async_value: str = ""
     participants: list = field(default_factory=list)
@@ -1147,6 +1206,7 @@ def build_preview_embed(state: AddGameState):
 
     winner_text = state.winner if state.winner else "Kein Gewinner / abgebrochen"
     community_text = ", ".join(state.community_awards) if state.community_awards else "-"
+    modification_text = format_modifications_for_sheet(state) if state.modifikationen else "-"
 
     embed = discord.Embed(
         title="Vorschau: Neues Spiel",
@@ -1159,7 +1219,7 @@ def build_preview_embed(state: AddGameState):
             f"Datum: **{state.datum}**\n"
             f"Punkte: **{state.punkte}**\n"
             f"Erweiterung: **{state.erweiterung}**\n"
-            f"Modifikation: **{state.modifikation}**\n"
+            f"Modifikation: **{modification_text}**\n"
             f"ASYNC: **{state.async_value}**"
         ),
         inline=False
@@ -1194,12 +1254,13 @@ def append_game_to_sheet(state: AddGameState):
     player_cell = build_player_cell_from_state(state)
     community_cell = ", ".join(state.community_awards)
     winner_cell = state.winner if state.winner else ""
+    modification_cell = format_modifications_for_sheet(state)
 
     row_data = {
         "Datum": state.datum,
         "Punkte": state.punkte,
         "Erweiterung": state.erweiterung,
-        "Modifikation": state.modifikation,
+        "Modifikation": modification_cell,
         "Gewinner": winner_cell,
         "Spieler (VP, Volk)": player_cell,
         "Spieler (Volk, VP)": player_cell,
@@ -1283,7 +1344,7 @@ class BasicGameModal(discord.ui.Modal, title="Neues Spiel - Datum"):
         view = GameSettingsSelectionView(self.state)
 
         await interaction.response.send_message(
-            "Schritt 1: Wähle Punkte, Erweiterung und Modifikation.",
+            "Schritt 1: Wähle Punkte, Erweiterung und eine oder mehrere Modifikationen.",
             view=view,
             ephemeral=True
         )
@@ -1318,7 +1379,7 @@ class PointsSelect(discord.ui.Select):
         self.state.punkte = value
 
         await interaction.response.edit_message(
-            content="Schritt 1: Wähle Punkte, Erweiterung und Modifikation.",
+            content="Schritt 1: Wähle Punkte, Erweiterung und eine oder mehrere Modifikationen.",
             view=GameSettingsSelectionView(self.state)
         )
 
@@ -1352,7 +1413,7 @@ class ExpansionSelect(discord.ui.Select):
         self.state.erweiterung = value
 
         await interaction.response.edit_message(
-            content="Schritt 1: Wähle Punkte, Erweiterung und Modifikation.",
+            content="Schritt 1: Wähle Punkte, Erweiterung und eine oder mehrere Modifikationen.",
             view=GameSettingsSelectionView(self.state)
         )
 
@@ -1361,32 +1422,35 @@ class ModificationSelect(discord.ui.Select):
     def __init__(self, state: AddGameState):
         self.state = state
 
-        options = build_select_options_with_add_first(
+        options = build_multi_select_options_with_add_first(
             get_modification_options(),
-            state.modifikation,
+            state.modifikationen,
             "Neue Modifikation eintragen"
         )
 
         super().__init__(
-            placeholder="Modifikation auswählen",
+            placeholder="Modifikation(en) auswählen",
             min_values=1,
-            max_values=1,
+            max_values=len(options),
             options=options
         )
 
     async def callback(self, interaction: discord.Interaction):
-        value = self.values[0]
+        selected = [
+            value for value in self.values
+            if value != "__add__"
+        ]
 
-        if value == "__add__":
+        self.state.modifikationen = clean_selected_modifications(selected)
+
+        if "__add__" in self.values:
             await interaction.response.send_modal(
                 CustomSettingModal(self.state, "modification")
             )
             return
 
-        self.state.modifikation = value
-
         await interaction.response.edit_message(
-            content="Schritt 1: Wähle Punkte, Erweiterung und Modifikation.",
+            content="Schritt 1: Wähle Punkte, Erweiterung und eine oder mehrere Modifikationen.",
             view=GameSettingsSelectionView(self.state)
         )
 
@@ -1443,7 +1507,14 @@ class CustomSettingModal(discord.ui.Modal):
 
         else:
             add_botdata_modification(value)
-            self.state.modifikation = value
+
+            current = [
+                modification for modification in self.state.modifikationen
+                if normalize_name(modification) != normalize_name(value)
+            ]
+
+            current.append(value)
+            self.state.modifikationen = clean_selected_modifications(current)
             label = "Modifikation"
 
         await interaction.response.send_message(
@@ -1484,9 +1555,9 @@ class GameSettingsSelectionView(OwnerOnlyView):
             )
             return
 
-        if not self.state.modifikation:
+        if not self.state.modifikationen:
             await interaction.response.send_message(
-                "Bitte Modifikation auswählen.",
+                "Bitte mindestens eine Modifikation auswählen. Wenn keine Modifikation genutzt wurde, wähle `Nein`.",
                 ephemeral=True
             )
             return
