@@ -195,14 +195,14 @@ DEFAULT_POINTS = [
 DEFAULT_EXPANSIONS = [
     "Basis",
     "PoK",
-    "PoK + TE"
+    "TE"
 ]
 
 DEFAULT_MODIFICATIONS = [
-    "Nein",
     "Hidden Agenda",
     "Twilights Fall",
-    "Absols Agendas, Minor Factions",
+    "Absols Agendas",
+    "Minor Factions",
     "Cosmic Phenomenae",
     "4/4/4",
     "Total War"
@@ -212,6 +212,22 @@ PLAYER_COLUMN_CANDIDATES = [
     "Spieler (VP, Volk)",
     "Spieler (Volk, VP)"
 ]
+
+PLAYER_RENAME_MAP = {
+    "chris": "Chris S."
+}
+
+EXCLUDED_PLAYER_NAMES = {
+    "ben",
+    "carmelo",
+    "randy",
+    "simone",
+    "julian"
+}
+
+MAX_PLAYERS_PER_GAME = 8
+MAX_EXTERNAL_PLAYERS = 7
+EXTERNAL_PLAYER_BASE_NAME = "Externer Spieler"
 
 _player_name_cache = {
     "timestamp": 0,
@@ -230,6 +246,46 @@ def normalize_name(name: str) -> str:
 
 def clean_text(value: str) -> str:
     return str(value).strip()
+
+
+def canonical_player_name(name: str) -> str:
+    name = clean_text(name)
+
+    if not name:
+        return ""
+
+    key = normalize_name(name)
+
+    if key in PLAYER_RENAME_MAP:
+        return PLAYER_RENAME_MAP[key]
+
+    if key in EXCLUDED_PLAYER_NAMES:
+        return EXTERNAL_PLAYER_BASE_NAME
+
+    return name
+
+
+def normalize_player_name(name: str) -> str:
+    return normalize_name(canonical_player_name(name))
+
+
+def is_external_player_name(name: str) -> bool:
+    return normalize_player_name(name).startswith(normalize_name(EXTERNAL_PLAYER_BASE_NAME))
+
+
+def is_excluded_from_player_dropdown(name: str) -> bool:
+    canonical = canonical_player_name(name)
+
+    if not canonical:
+        return True
+
+    if normalize_name(canonical) in EXCLUDED_PLAYER_NAMES:
+        return True
+
+    if is_external_player_name(canonical):
+        return True
+
+    return False
 
 
 def unique_preserve_order(values):
@@ -299,6 +355,18 @@ def normalize_date_input(value: str):
     return None
 
 
+def parse_date_for_sort(value: str):
+    normalized = normalize_date_input(value)
+
+    if not normalized:
+        return None
+
+    try:
+        return datetime.strptime(normalized, "%d.%m.%Y")
+    except ValueError:
+        return None
+
+
 def get_rows():
     return sheet.get_all_records()
 
@@ -310,13 +378,35 @@ def get_player_column(row):
     return ""
 
 
-def get_unique_sheet_column_values(column_name):
+def split_multi_value_cell(value: str):
+    value = clean_text(value)
+
+    if not value:
+        return []
+
+    if normalize_name(value) == "nein":
+        return []
+
+    if normalize_name(value) == "absols agendas, minor factions":
+        return ["Absols Agendas", "Minor Factions"]
+
+    parts = [part.strip() for part in value.split("+")]
+
+    return [part for part in parts if part]
+
+
+def get_unique_sheet_column_values(column_name, split_multi=False):
     values = []
 
     for row in get_rows():
         value = clean_text(row.get(column_name, ""))
 
-        if value:
+        if not value:
+            continue
+
+        if split_multi:
+            values.extend(split_multi_value_cell(value))
+        else:
             values.append(value)
 
     return unique_preserve_order(values)
@@ -327,7 +417,7 @@ def split_community_names(entry: str):
         return []
 
     return [
-        name.strip()
+        canonical_player_name(name.strip())
         for name in str(entry).split(",")
         if name.strip()
     ]
@@ -389,6 +479,7 @@ def parse_player_entry(entry: str):
     ):
         name, faction = faction, name
 
+    name = canonical_player_name(name)
     faction = canonical_faction(faction)
 
     return {
@@ -479,14 +570,14 @@ def get_botdata_faction_records():
 
 
 def add_botdata_player(name: str):
-    name = clean_text(name)
+    name = canonical_player_name(name)
 
     if not name:
         return False, "Leerer Spielername."
 
     existing = get_all_player_names_cached(force_refresh=True)
 
-    if normalize_name(name) in [normalize_name(p) for p in existing]:
+    if normalize_player_name(name) in [normalize_player_name(p) for p in existing]:
         return False, f"**{name}** existiert bereits."
 
     botdata = get_botdata_sheet(create=True)
@@ -582,29 +673,33 @@ def get_points_options():
 def get_expansion_options():
     return unique_preserve_order(
         DEFAULT_EXPANSIONS
-        + get_unique_sheet_column_values("Erweiterung")
+        + get_unique_sheet_column_values("Erweiterung", split_multi=True)
         + get_botdata_column_values(BOTDATA_COL_EXPANSION)
     )
 
 
 def get_modification_options():
-    return unique_preserve_order(
+    values = unique_preserve_order(
         DEFAULT_MODIFICATIONS
-        + get_unique_sheet_column_values("Modifikation")
+        + get_unique_sheet_column_values("Modifikation", split_multi=True)
         + get_botdata_column_values(BOTDATA_COL_MODIFICATION)
     )
 
+    return [
+        value for value in values
+        if normalize_name(value) not in {
+            "nein",
+            "absols agendas, minor factions"
+        }
+    ]
 
-def clean_selected_modifications(values):
-    cleaned = unique_preserve_order(values)
 
-    if len(cleaned) > 1:
-        cleaned = [
-            value for value in cleaned
-            if normalize_name(value) != "nein"
-        ]
+def clean_selected_values(values):
+    return unique_preserve_order(values)
 
-    return cleaned
+
+def format_expansions_for_sheet(state):
+    return " + ".join(state.erweiterungen)
 
 
 def format_modifications_for_sheet(state):
@@ -625,19 +720,23 @@ def get_all_player_names_cached(force_refresh=False):
     names = set()
 
     for saved_name in get_botdata_players():
-        names.add(saved_name)
+        player_name = canonical_player_name(saved_name)
+        if player_name and not is_excluded_from_player_dropdown(player_name):
+            names.add(player_name)
 
     for row in rows:
-        winner = row.get("Gewinner")
-        if winner and str(winner).strip():
-            names.add(str(winner).strip())
+        winner = canonical_player_name(row.get("Gewinner", ""))
+        if winner and not is_excluded_from_player_dropdown(winner):
+            names.add(winner)
 
         for community_name in split_community_names(row.get("Community Preis")):
-            names.add(community_name)
+            if community_name and not is_excluded_from_player_dropdown(community_name):
+                names.add(community_name)
 
         for player in parse_game_players(get_player_column(row)):
-            if player["name"]:
-                names.add(player["name"])
+            player_name = player["name"]
+            if player_name and not is_excluded_from_player_dropdown(player_name):
+                names.add(player_name)
 
     sorted_names = sorted(names, key=lambda x: x.lower())
 
@@ -817,11 +916,11 @@ def get_target_points(row, players):
     if points_from_sheet and points_from_sheet > 0:
         return points_from_sheet
 
-    winner = normalize_name(row.get("Gewinner", ""))
+    winner = normalize_player_name(row.get("Gewinner", ""))
 
     if winner:
         for player in players:
-            if normalize_name(player["name"]) == winner and player["vp"]:
+            if normalize_player_name(player["name"]) == winner and player["vp"]:
                 return player["vp"]
 
     return None
@@ -853,6 +952,53 @@ def get_next_available_sheet_row():
     return max(last_non_empty_row + 1, 2)
 
 
+def sort_sheet_by_date():
+    all_values = sheet.get_all_values()
+
+    if not all_values:
+        return
+
+    headers = all_values[0]
+
+    if "Datum" not in headers:
+        return
+
+    date_index = headers.index("Datum")
+    width = len(headers)
+
+    non_empty_rows = []
+
+    for row in all_values[1:]:
+        padded_row = row + [""] * (width - len(row))
+        padded_row = padded_row[:width]
+
+        if any(str(cell).strip() for cell in padded_row):
+            non_empty_rows.append(padded_row)
+
+    def sort_key(row):
+        parsed_date = parse_date_for_sort(row[date_index])
+
+        if parsed_date is None:
+            return (1, datetime.max)
+
+        return (0, parsed_date)
+
+    sorted_rows = sorted(non_empty_rows, key=sort_key)
+
+    last_row_to_clear = max(len(all_values), len(sorted_rows) + 1)
+    last_col = rowcol_to_a1(1, width).replace("1", "")
+
+    sheet.batch_clear([f"A2:{last_col}{last_row_to_clear}"])
+
+    if sorted_rows:
+        end_cell = rowcol_to_a1(len(sorted_rows) + 1, width)
+        sheet.update(
+            f"A2:{end_cell}",
+            sorted_rows,
+            value_input_option="USER_ENTERED"
+        )
+
+
 # =========================================================
 # 🏆 HALL OF FAME
 # =========================================================
@@ -862,10 +1008,10 @@ def get_halloffame():
     winners = []
 
     for row in rows:
-        winner = row.get("Gewinner")
+        winner = canonical_player_name(row.get("Gewinner"))
 
         if winner and str(winner).strip():
-            winners.append(str(winner).strip())
+            winners.append(winner)
 
     counts = Counter(winners)
     sorted_data = counts.most_common()
@@ -909,7 +1055,7 @@ def get_community():
 def get_player_stats(name: str):
     rows = get_rows()
 
-    search_name = normalize_name(name)
+    search_name = normalize_player_name(name)
 
     games_played = 0
     wins = 0
@@ -935,17 +1081,17 @@ def get_player_stats(name: str):
         player_entry = None
 
         for player in players:
-            if normalize_name(player["name"]) == search_name:
+            if normalize_player_name(player["name"]) == search_name:
                 player_entry = player
                 break
 
-        winner_name = normalize_name(row.get("Gewinner", ""))
+        winner_name = normalize_player_name(row.get("Gewinner", ""))
 
         if winner_name == search_name:
             wins += 1
 
         for community_name in split_community_names(row.get("Community Preis")):
-            if normalize_name(community_name) == search_name:
+            if normalize_player_name(community_name) == search_name:
                 community_awards += 1
 
         if not player_entry:
@@ -1013,7 +1159,7 @@ def get_faction_stats():
         if not players:
             continue
 
-        winner_name = normalize_name(row.get("Gewinner", ""))
+        winner_name = normalize_player_name(row.get("Gewinner", ""))
 
         for player in players:
             faction = player["faction"] or "Unbekannt"
@@ -1029,7 +1175,7 @@ def get_faction_stats():
             faction_stats[faction]["games"] += 1
             faction_stats[faction]["players"][player_name] += 1
 
-            if winner_name and normalize_name(player_name) == winner_name:
+            if winner_name and normalize_player_name(player_name) == winner_name:
                 faction_stats[faction]["wins"] += 1
 
     result = []
@@ -1107,7 +1253,7 @@ class AddGameState:
     owner_id: int
     datum: str = ""
     punkte: str = ""
-    erweiterung: str = ""
+    erweiterungen: list = field(default_factory=list)
     modifikationen: list = field(default_factory=list)
     kommentare: str = ""
     async_value: str = ""
@@ -1206,6 +1352,7 @@ def build_preview_embed(state: AddGameState):
 
     winner_text = state.winner if state.winner else "Kein Gewinner / abgebrochen"
     community_text = ", ".join(state.community_awards) if state.community_awards else "-"
+    expansion_text = format_expansions_for_sheet(state) if state.erweiterungen else "-"
     modification_text = format_modifications_for_sheet(state) if state.modifikationen else "-"
 
     embed = discord.Embed(
@@ -1218,7 +1365,7 @@ def build_preview_embed(state: AddGameState):
         value=(
             f"Datum: **{state.datum}**\n"
             f"Punkte: **{state.punkte}**\n"
-            f"Erweiterung: **{state.erweiterung}**\n"
+            f"Erweiterung: **{expansion_text}**\n"
             f"Modifikation: **{modification_text}**\n"
             f"ASYNC: **{state.async_value}**"
         ),
@@ -1254,12 +1401,13 @@ def append_game_to_sheet(state: AddGameState):
     player_cell = build_player_cell_from_state(state)
     community_cell = ", ".join(state.community_awards)
     winner_cell = state.winner if state.winner else ""
+    expansion_cell = format_expansions_for_sheet(state)
     modification_cell = format_modifications_for_sheet(state)
 
     row_data = {
         "Datum": state.datum,
         "Punkte": state.punkte,
-        "Erweiterung": state.erweiterung,
+        "Erweiterung": expansion_cell,
         "Modifikation": modification_cell,
         "Gewinner": winner_cell,
         "Spieler (VP, Volk)": player_cell,
@@ -1285,8 +1433,43 @@ def append_game_to_sheet(state: AddGameState):
         value_input_option="USER_ENTERED"
     )
 
+    sort_sheet_by_date()
+
     _player_name_cache["timestamp"] = 0
     _faction_name_cache["timestamp"] = 0
+
+
+def add_external_players_to_state(state: AddGameState, count: int):
+    current_external_count = sum(
+        1 for player_name in state.participants
+        if is_external_player_name(player_name)
+    )
+
+    remaining_external_slots = MAX_EXTERNAL_PLAYERS - current_external_count
+    remaining_player_slots = MAX_PLAYERS_PER_GAME - len(state.participants)
+    amount_to_add = min(count, remaining_external_slots, remaining_player_slots)
+
+    if amount_to_add <= 0:
+        return 0
+
+    existing_names = {normalize_name(name) for name in state.participants}
+    added = 0
+    next_number = 1
+
+    while added < amount_to_add and next_number <= MAX_EXTERNAL_PLAYERS:
+        if next_number == 1:
+            candidate = EXTERNAL_PLAYER_BASE_NAME
+        else:
+            candidate = f"{EXTERNAL_PLAYER_BASE_NAME} {next_number}"
+
+        if normalize_name(candidate) not in existing_names:
+            state.participants.append(candidate)
+            existing_names.add(normalize_name(candidate))
+            added += 1
+
+        next_number += 1
+
+    return added
 
 
 # =========================================================
@@ -1344,7 +1527,7 @@ class BasicGameModal(discord.ui.Modal, title="Neues Spiel - Datum"):
         view = GameSettingsSelectionView(self.state)
 
         await interaction.response.send_message(
-            "Schritt 1: Wähle Punkte, Erweiterung und eine oder mehrere Modifikationen.",
+            "Schritt 1: Wähle Punkte, Erweiterungen und Modifikationen.",
             view=view,
             ephemeral=True
         )
@@ -1379,7 +1562,7 @@ class PointsSelect(discord.ui.Select):
         self.state.punkte = value
 
         await interaction.response.edit_message(
-            content="Schritt 1: Wähle Punkte, Erweiterung und eine oder mehrere Modifikationen.",
+            content="Schritt 1: Wähle Punkte, Erweiterungen und Modifikationen.",
             view=GameSettingsSelectionView(self.state)
         )
 
@@ -1388,32 +1571,35 @@ class ExpansionSelect(discord.ui.Select):
     def __init__(self, state: AddGameState):
         self.state = state
 
-        options = build_select_options_with_add_first(
+        options = build_multi_select_options_with_add_first(
             get_expansion_options(),
-            state.erweiterung,
+            state.erweiterungen,
             "Neue Erweiterung eintragen"
         )
 
         super().__init__(
-            placeholder="Erweiterung auswählen",
+            placeholder="Erweiterung(en) auswählen",
             min_values=1,
-            max_values=1,
+            max_values=len(options),
             options=options
         )
 
     async def callback(self, interaction: discord.Interaction):
-        value = self.values[0]
+        selected = [
+            value for value in self.values
+            if value != "__add__"
+        ]
 
-        if value == "__add__":
+        self.state.erweiterungen = clean_selected_values(selected)
+
+        if "__add__" in self.values:
             await interaction.response.send_modal(
                 CustomSettingModal(self.state, "expansion")
             )
             return
 
-        self.state.erweiterung = value
-
         await interaction.response.edit_message(
-            content="Schritt 1: Wähle Punkte, Erweiterung und eine oder mehrere Modifikationen.",
+            content="Schritt 1: Wähle Punkte, Erweiterungen und Modifikationen.",
             view=GameSettingsSelectionView(self.state)
         )
 
@@ -1429,8 +1615,8 @@ class ModificationSelect(discord.ui.Select):
         )
 
         super().__init__(
-            placeholder="Modifikation(en) auswählen",
-            min_values=1,
+            placeholder="Modifikation(en) auswählen, optional",
+            min_values=0,
             max_values=len(options),
             options=options
         )
@@ -1441,7 +1627,7 @@ class ModificationSelect(discord.ui.Select):
             if value != "__add__"
         ]
 
-        self.state.modifikationen = clean_selected_modifications(selected)
+        self.state.modifikationen = clean_selected_values(selected)
 
         if "__add__" in self.values:
             await interaction.response.send_modal(
@@ -1450,7 +1636,7 @@ class ModificationSelect(discord.ui.Select):
             return
 
         await interaction.response.edit_message(
-            content="Schritt 1: Wähle Punkte, Erweiterung und eine oder mehrere Modifikationen.",
+            content="Schritt 1: Wähle Punkte, Erweiterungen und Modifikationen.",
             view=GameSettingsSelectionView(self.state)
         )
 
@@ -1502,7 +1688,14 @@ class CustomSettingModal(discord.ui.Modal):
 
         elif self.setting_type == "expansion":
             add_botdata_expansion(value)
-            self.state.erweiterung = value
+
+            current = [
+                expansion for expansion in self.state.erweiterungen
+                if normalize_name(expansion) != normalize_name(value)
+            ]
+
+            current.append(value)
+            self.state.erweiterungen = clean_selected_values(current)
             label = "Erweiterung"
 
         else:
@@ -1514,7 +1707,7 @@ class CustomSettingModal(discord.ui.Modal):
             ]
 
             current.append(value)
-            self.state.modifikationen = clean_selected_modifications(current)
+            self.state.modifikationen = clean_selected_values(current)
             label = "Modifikation"
 
         await interaction.response.send_message(
@@ -1548,16 +1741,9 @@ class GameSettingsSelectionView(OwnerOnlyView):
             )
             return
 
-        if not self.state.erweiterung:
+        if not self.state.erweiterungen:
             await interaction.response.send_message(
-                "Bitte Erweiterung auswählen.",
-                ephemeral=True
-            )
-            return
-
-        if not self.state.modifikationen:
-            await interaction.response.send_message(
-                "Bitte mindestens eine Modifikation auswählen. Wenn keine Modifikation genutzt wurde, wähle `Nein`.",
+                "Bitte mindestens eine Erweiterung auswählen.",
                 ephemeral=True
             )
             return
@@ -1566,7 +1752,7 @@ class GameSettingsSelectionView(OwnerOnlyView):
         view = PlayerAsyncSelectionView(self.state, player_names)
 
         await interaction.response.edit_message(
-            content="Schritt 2: Wähle ASYNC und bis zu 8 Spieler aus. Falls ein Name fehlt, wähle 'Neuen Spieler eintragen'.",
+            content="Schritt 2: Wähle ASYNC und bis zu 8 Spieler aus. Falls ein Name fehlt, wähle 'Neuen Spieler eintragen'. Für externe Spieler wähle 'Externe Spieler hinzufügen'.",
             view=view
         )
 
@@ -1608,23 +1794,30 @@ class ParticipantSelect(discord.ui.Select):
         seen = set()
 
         for name in state.participants:
-            key = normalize_name(name)
+            if is_external_player_name(name):
+                continue
+
+            key = normalize_player_name(name)
             if key not in seen:
                 visible_names.append(name)
                 seen.add(key)
 
         for name in player_names:
-            key = normalize_name(name)
+            key = normalize_player_name(name)
             if key not in seen:
                 visible_names.append(name)
                 seen.add(key)
-            if len(visible_names) >= 24:
+            if len(visible_names) >= 23:
                 break
 
         options = [
             discord.SelectOption(
                 label="Neuen Spieler eintragen",
                 value="__add_player__"
+            ),
+            discord.SelectOption(
+                label="Externe Spieler hinzufügen",
+                value="__add_external__"
             )
         ]
 
@@ -1640,20 +1833,29 @@ class ParticipantSelect(discord.ui.Select):
         super().__init__(
             placeholder="Spieler auswählen, maximal 8",
             min_values=1,
-            max_values=min(8, len(options)),
+            max_values=min(MAX_PLAYERS_PER_GAME, len(options)),
             options=options[:25]
         )
 
     async def callback(self, interaction: discord.Interaction):
-        selected_players = [
+        selected_real_players = [
             value for value in self.values
-            if value != "__add_player__"
+            if value not in {"__add_player__", "__add_external__"}
         ]
 
-        self.state.participants = selected_players
+        current_external_players = [
+            player_name for player_name in self.state.participants
+            if is_external_player_name(player_name)
+        ]
+
+        self.state.participants = selected_real_players + current_external_players
 
         if "__add_player__" in self.values:
             await interaction.response.send_modal(CustomPlayerModal(self.state))
+            return
+
+        if "__add_external__" in self.values:
+            await interaction.response.send_modal(ExternalPlayersModal(self.state))
             return
 
         await interaction.response.defer()
@@ -1681,11 +1883,13 @@ class CustomPlayerModal(discord.ui.Modal, title="Neuen Spieler eintragen"):
             )
             return
 
+        final_name = canonical_player_name(raw_name)
+
         existing_names = get_all_player_names_cached(force_refresh=True)
         existing_match = next(
             (
                 name for name in existing_names
-                if normalize_name(name) == normalize_name(raw_name)
+                if normalize_player_name(name) == normalize_player_name(final_name)
             ),
             None
         )
@@ -1694,8 +1898,7 @@ class CustomPlayerModal(discord.ui.Modal, title="Neuen Spieler eintragen"):
             final_name = existing_match
             message = f"Spieler **{final_name}** existiert bereits und wurde ausgewählt."
         else:
-            success, message = add_botdata_player(raw_name)
-            final_name = raw_name
+            success, message = add_botdata_player(final_name)
 
             if not success and "existiert bereits" not in message:
                 await interaction.response.send_message(
@@ -1704,8 +1907,8 @@ class CustomPlayerModal(discord.ui.Modal, title="Neuen Spieler eintragen"):
                 )
                 return
 
-        if normalize_name(final_name) not in [normalize_name(p) for p in self.state.participants]:
-            if len(self.state.participants) >= 8:
+        if normalize_player_name(final_name) not in [normalize_player_name(p) for p in self.state.participants]:
+            if len(self.state.participants) >= MAX_PLAYERS_PER_GAME:
                 await interaction.response.send_message(
                     "Es sind bereits 8 Spieler ausgewählt. Entferne erst einen Spieler, bevor du einen neuen hinzufügst.",
                     ephemeral=True
@@ -1719,6 +1922,47 @@ class CustomPlayerModal(discord.ui.Modal, title="Neuen Spieler eintragen"):
 
         await interaction.response.send_message(
             f"{message}\n\nSchritt 2: Prüfe ASYNC und Spielerauswahl, dann klicke auf Weiter.",
+            view=view,
+            ephemeral=True
+        )
+
+
+class ExternalPlayersModal(discord.ui.Modal, title="Externe Spieler hinzufügen"):
+    amount = discord.ui.TextInput(
+        label="Anzahl externer Spieler",
+        placeholder="1-7",
+        required=True,
+        max_length=1
+    )
+
+    def __init__(self, state: AddGameState):
+        super().__init__()
+        self.state = state
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            requested_amount = int(str(self.amount.value).strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "Bitte eine Zahl zwischen 1 und 7 eingeben.",
+                ephemeral=True
+            )
+            return
+
+        if requested_amount < 1 or requested_amount > MAX_EXTERNAL_PLAYERS:
+            await interaction.response.send_message(
+                "Bitte eine Zahl zwischen 1 und 7 eingeben.",
+                ephemeral=True
+            )
+            return
+
+        added = add_external_players_to_state(self.state, requested_amount)
+
+        player_names = get_all_player_names_cached(force_refresh=True)
+        view = PlayerAsyncSelectionView(self.state, player_names)
+
+        await interaction.response.send_message(
+            f"{added} externe Spieler wurden hinzugefügt.\n\nSchritt 2: Prüfe ASYNC und Spielerauswahl, dann klicke auf Weiter.",
             view=view,
             ephemeral=True
         )
@@ -1750,6 +1994,13 @@ class PlayerAsyncSelectionView(OwnerOnlyView):
         if not self.state.participants:
             await interaction.response.send_message(
                 "Bitte mindestens einen Spieler auswählen.",
+                ephemeral=True
+            )
+            return
+
+        if len(self.state.participants) > MAX_PLAYERS_PER_GAME:
+            await interaction.response.send_message(
+                "Es dürfen maximal 8 Spieler ausgewählt sein.",
                 ephemeral=True
             )
             return
@@ -2315,7 +2566,7 @@ async def player(interaction: discord.Interaction, name: str):
         avg_normalized_text = f"{stats['avg_normalized_vp']:.2f} VP"
 
     embed = discord.Embed(
-        title=f"Spielerstatistik: {name}",
+        title=f"Spielerstatistik: {canonical_player_name(name)}",
         color=0x3498DB
     )
 
