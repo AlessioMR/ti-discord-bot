@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 import gspread
+from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 from collections import Counter
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ gc = gspread.authorize(creds)
 # 📄 SHEET ID
 # =========================================================
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
+BOTDATA_SHEET_NAME = "BotData"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -101,6 +103,38 @@ FACTION_CANONICAL = {
     "tf_rot": "TF_Rot"
 }
 
+STANDARD_FACTIONS_A_M = [
+    "Arborec",
+    "Argent",
+    "Barony",
+    "Cabal",
+    "Creuss",
+    "Empyrean",
+    "Hacan",
+    "Jol Nar",
+    "Keleres",
+    "L1",
+    "Mahact",
+    "Mentak",
+    "Muaat"
+]
+
+STANDARD_FACTIONS_N_Z = [
+    "Naalu",
+    "Naaz",
+    "Nekro",
+    "Nomad",
+    "Saar",
+    "Sardakk",
+    "Sol",
+    "Titans",
+    "Winnu",
+    "Xxcha",
+    "Yin",
+    "Yssaril"
+]
+
+STANDARD_FACTIONS_ALL = STANDARD_FACTIONS_A_M + STANDARD_FACTIONS_N_Z
 KNOWN_FACTIONS = set(FACTION_CANONICAL.keys())
 
 PLAYER_COLUMN_CANDIDATES = [
@@ -111,6 +145,11 @@ PLAYER_COLUMN_CANDIDATES = [
 PLAYER_DETAIL_CHUNK_SIZE = 4
 
 _player_name_cache = {
+    "timestamp": 0,
+    "names": []
+}
+
+_faction_name_cache = {
     "timestamp": 0,
     "names": []
 }
@@ -259,14 +298,110 @@ def parse_game_players(raw: str):
     return result
 
 
-def get_all_player_names_cached():
+def get_botdata_sheet(create=False):
+    try:
+        return spreadsheet.worksheet(BOTDATA_SHEET_NAME)
+    except WorksheetNotFound:
+        if not create:
+            return None
+
+        botdata = spreadsheet.add_worksheet(
+            title=BOTDATA_SHEET_NAME,
+            rows=500,
+            cols=2
+        )
+
+        botdata.update(
+            "A1:B1",
+            [["PlayerName", "FactionName"]]
+        )
+
+        return botdata
+
+
+def get_botdata_players():
+    botdata = get_botdata_sheet(create=False)
+
+    if botdata is None:
+        return []
+
+    values = botdata.col_values(1)
+
+    return [
+        value.strip()
+        for value in values[1:]
+        if value.strip()
+    ]
+
+
+def get_botdata_factions():
+    botdata = get_botdata_sheet(create=False)
+
+    if botdata is None:
+        return []
+
+    values = botdata.col_values(2)
+
+    return [
+        value.strip()
+        for value in values[1:]
+        if value.strip()
+    ]
+
+
+def add_botdata_player(name: str):
+    name = clean_text(name)
+
+    if not name:
+        return False, "Leerer Spielername."
+
+    existing = get_all_player_names_cached(force_refresh=True)
+
+    if normalize_name(name) in [normalize_name(p) for p in existing]:
+        return False, f"**{name}** existiert bereits."
+
+    botdata = get_botdata_sheet(create=True)
+    botdata.append_row([name, ""], value_input_option="USER_ENTERED")
+
+    _player_name_cache["timestamp"] = 0
+
+    return True, f"Spieler **{name}** wurde hinzugefügt."
+
+
+def add_botdata_faction(name: str):
+    name = canonical_faction(name)
+
+    if not name:
+        return False, "Leerer Völkername."
+
+    existing = get_all_faction_names_cached(force_refresh=True)
+
+    if normalize_name(name) in [normalize_name(f) for f in existing]:
+        return False, f"Volk **{name}** existiert bereits."
+
+    botdata = get_botdata_sheet(create=True)
+    botdata.append_row(["", name], value_input_option="USER_ENTERED")
+
+    _faction_name_cache["timestamp"] = 0
+
+    return True, f"Volk **{name}** wurde hinzugefügt."
+
+
+def get_all_player_names_cached(force_refresh=False):
     now = time.time()
 
-    if now - _player_name_cache["timestamp"] < 300 and _player_name_cache["names"]:
+    if (
+        not force_refresh
+        and now - _player_name_cache["timestamp"] < 300
+        and _player_name_cache["names"]
+    ):
         return _player_name_cache["names"]
 
     rows = get_rows()
     names = set()
+
+    for saved_name in get_botdata_players():
+        names.add(saved_name)
 
     for row in rows:
         winner = row.get("Gewinner")
@@ -286,6 +421,48 @@ def get_all_player_names_cached():
     _player_name_cache["names"] = sorted_names
 
     return sorted_names
+
+
+def get_all_faction_names_cached(force_refresh=False):
+    now = time.time()
+
+    if (
+        not force_refresh
+        and now - _faction_name_cache["timestamp"] < 300
+        and _faction_name_cache["names"]
+    ):
+        return _faction_name_cache["names"]
+
+    rows = get_rows()
+    factions = set(STANDARD_FACTIONS_ALL)
+
+    for saved_faction in get_botdata_factions():
+        factions.add(canonical_faction(saved_faction))
+
+    for row in rows:
+        for player in parse_game_players(get_player_column(row)):
+            faction = player.get("faction")
+
+            if faction and faction != "Unbekannt":
+                factions.add(canonical_faction(faction))
+
+    sorted_factions = sorted(factions, key=lambda x: x.lower())
+
+    _faction_name_cache["timestamp"] = now
+    _faction_name_cache["names"] = sorted_factions
+
+    return sorted_factions
+
+
+def get_custom_faction_names():
+    all_factions = get_all_faction_names_cached()
+    standard_keys = {normalize_name(f) for f in STANDARD_FACTIONS_ALL}
+
+    return [
+        faction
+        for faction in all_factions
+        if normalize_name(faction) not in standard_keys
+    ]
 
 
 async def player_name_autocomplete(
@@ -602,36 +779,37 @@ class AddGameState:
     winner_selected: bool = False
     community_awards: list = field(default_factory=list)
     player_details: dict = field(default_factory=dict)
+    faction_categories: dict = field(default_factory=dict)
 
 
-def parse_vp_faction_input(value: str):
-    text = str(value).strip()
+def ensure_player_detail(state: AddGameState, player_name: str):
+    if player_name not in state.player_details:
+        state.player_details[player_name] = {
+            "vp": None,
+            "vp_selected": False,
+            "faction": ""
+        }
 
-    if not text:
-        return None, "Unbekannt"
+    return state.player_details[player_name]
 
-    if ";" in text:
-        parts = [p.strip() for p in text.split(";")]
+
+def build_player_detail_content(state: AddGameState, index: int):
+    player_name = state.participants[index]
+    detail = ensure_player_detail(state, player_name)
+
+    if detail["vp_selected"]:
+        vp_text = "unbekannt" if detail["vp"] is None else format_number_for_sheet(detail["vp"])
     else:
-        parts = [p.strip() for p in text.split(",")]
+        vp_text = "nicht gewählt"
 
-    parts = [p for p in parts if p != ""]
+    faction_text = detail["faction"] if detail["faction"] else "nicht gewählt"
 
-    vp = None
-    faction = None
-
-    for part in parts:
-        number = parse_number(part)
-
-        if number is not None and vp is None:
-            vp = number
-        elif number is None and faction is None:
-            faction = part
-
-    if not faction:
-        faction = "Unbekannt"
-
-    return vp, canonical_faction(faction)
+    return (
+        f"Schritt 4: VP und Volk auswählen\n\n"
+        f"Spieler **{index + 1}/{len(state.participants)}**: **{player_name}**\n"
+        f"VP: **{vp_text}**\n"
+        f"Volk: **{faction_text}**"
+    )
 
 
 def build_player_cell_from_state(state: AddGameState):
@@ -759,6 +937,7 @@ def append_game_to_sheet(state: AddGameState):
     sheet.append_row(row, value_input_option="USER_ENTERED")
 
     _player_name_cache["timestamp"] = 0
+    _faction_name_cache["timestamp"] = 0
 
 
 # =========================================================
@@ -832,7 +1011,7 @@ class BasicGameModal(discord.ui.Modal, title="Neues Spiel - Grunddaten"):
 
         if not player_names:
             await interaction.response.send_message(
-                "Keine bekannten Spielernamen im Sheet gefunden.",
+                "Keine bekannten Spielernamen gefunden. Füge zuerst Spieler mit `/siegtabelle add_player` hinzu.",
                 ephemeral=True
             )
             return
@@ -1019,63 +1198,283 @@ class WinnerCommunitySelectionView(OwnerOnlyView):
             )
             return
 
-        await interaction.response.send_modal(
-            PlayerDetailsModal(self.state, start_index=0)
+        view = PlayerDetailView(self.state, index=0)
+
+        await interaction.response.edit_message(
+            content=build_player_detail_content(self.state, 0),
+            view=view
         )
 
 
-class PlayerDetailsModal(discord.ui.Modal):
-    def __init__(self, state: AddGameState, start_index: int):
-        super().__init__(title="VP und Völker")
+class VPSelect(discord.ui.Select):
+    def __init__(self, state: AddGameState, index: int):
         self.state = state
-        self.start_index = start_index
-        self.inputs = []
+        self.index = index
 
-        selected_players = state.participants[
-            start_index:start_index + PLAYER_DETAIL_CHUNK_SIZE
+        player_name = state.participants[index]
+        detail = ensure_player_detail(state, player_name)
+
+        options = [
+            discord.SelectOption(
+                label="Unbekannt / leer",
+                value="__none__",
+                default=detail["vp_selected"] and detail["vp"] is None
+            )
         ]
 
-        for player_name in selected_players:
-            label = f"{player_name}: VP; Volk"
-
-            if len(label) > 45:
-                label = label[:42] + "..."
-
-            text_input = discord.ui.TextInput(
-                label=label,
-                placeholder="z.B. 10; Saar oder ; Saar",
-                required=True,
-                max_length=100
+        for value in range(0, 15):
+            options.append(
+                discord.SelectOption(
+                    label=str(value),
+                    value=str(value),
+                    default=detail["vp_selected"] and detail["vp"] == float(value)
+                )
             )
 
-            self.add_item(text_input)
-            self.inputs.append((player_name, text_input))
+        super().__init__(
+            placeholder="VP auswählen",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        player_name = self.state.participants[self.index]
+        detail = ensure_player_detail(self.state, player_name)
+
+        value = self.values[0]
+
+        if value == "__none__":
+            detail["vp"] = None
+        else:
+            detail["vp"] = float(value)
+
+        detail["vp_selected"] = True
+
+        await interaction.response.edit_message(
+            content=build_player_detail_content(self.state, self.index),
+            view=PlayerDetailView(self.state, self.index)
+        )
+
+
+class FactionCategorySelect(discord.ui.Select):
+    def __init__(self, state: AddGameState, index: int):
+        self.state = state
+        self.index = index
+
+        player_name = state.participants[index]
+        current_category = state.faction_categories.get(player_name, "standard_a_m")
+
+        options = [
+            discord.SelectOption(
+                label="Standard A-M",
+                value="standard_a_m",
+                default=current_category == "standard_a_m"
+            ),
+            discord.SelectOption(
+                label="Standard N-Z",
+                value="standard_n_z",
+                default=current_category == "standard_n_z"
+            ),
+            discord.SelectOption(
+                label="Custom / Homebrew",
+                value="custom",
+                default=current_category == "custom"
+            )
+        ]
+
+        super().__init__(
+            placeholder="Völker-Kategorie auswählen",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        player_name = self.state.participants[self.index]
+        self.state.faction_categories[player_name] = self.values[0]
+
+        await interaction.response.edit_message(
+            content=build_player_detail_content(self.state, self.index),
+            view=PlayerDetailView(self.state, self.index)
+        )
+
+
+class FactionSelect(discord.ui.Select):
+    def __init__(self, state: AddGameState, index: int):
+        self.state = state
+        self.index = index
+
+        player_name = state.participants[index]
+        detail = ensure_player_detail(state, player_name)
+
+        category = state.faction_categories.get(player_name, "standard_a_m")
+
+        if category == "standard_n_z":
+            faction_names = STANDARD_FACTIONS_N_Z
+        elif category == "custom":
+            faction_names = get_custom_faction_names()[:24]
+        else:
+            faction_names = STANDARD_FACTIONS_A_M
+
+        options = []
+
+        for faction in faction_names:
+            options.append(
+                discord.SelectOption(
+                    label=faction,
+                    value=faction,
+                    default=detail["faction"] == faction
+                )
+            )
+
+        if category == "custom":
+            options.append(
+                discord.SelectOption(
+                    label="Neues Volk eintragen",
+                    value="__custom__"
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Neues Volk eintragen",
+                    value="__custom__"
+                )
+            )
+
+        super().__init__(
+            placeholder="Volk auswählen",
+            min_values=1,
+            max_values=1,
+            options=options[:25]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+
+        if value == "__custom__":
+            await interaction.response.send_modal(
+                CustomFactionModal(self.state, self.index)
+            )
+            return
+
+        player_name = self.state.participants[self.index]
+        detail = ensure_player_detail(self.state, player_name)
+
+        detail["faction"] = canonical_faction(value)
+
+        await interaction.response.edit_message(
+            content=build_player_detail_content(self.state, self.index),
+            view=PlayerDetailView(self.state, self.index)
+        )
+
+
+class CustomFactionModal(discord.ui.Modal, title="Neues Volk eintragen"):
+    faction_name = discord.ui.TextInput(
+        label="Name des Volks",
+        placeholder="z.B. Crimson, DWS, Ralnel",
+        required=True,
+        max_length=50
+    )
+
+    def __init__(self, state: AddGameState, index: int):
+        super().__init__()
+        self.state = state
+        self.index = index
 
     async def on_submit(self, interaction: discord.Interaction):
-        for player_name, text_input in self.inputs:
-            vp, faction = parse_vp_faction_input(str(text_input.value))
+        faction_name = canonical_faction(str(self.faction_name.value).strip())
 
-            self.state.player_details[player_name] = {
-                "vp": vp,
-                "faction": faction
-            }
+        player_name = self.state.participants[self.index]
+        detail = ensure_player_detail(self.state, player_name)
 
-        next_index = self.start_index + PLAYER_DETAIL_CHUNK_SIZE
+        detail["faction"] = faction_name
+        self.state.faction_categories[player_name] = "custom"
+
+        add_botdata_faction(faction_name)
+
+        await interaction.response.send_message(
+            f"Volk **{faction_name}** wurde gespeichert und für **{player_name}** gesetzt.",
+            ephemeral=True
+        )
+
+
+class PlayerDetailView(OwnerOnlyView):
+    def __init__(self, state: AddGameState, index: int):
+        super().__init__(state)
+        self.index = index
+
+        self.add_item(VPSelect(state, index))
+        self.add_item(FactionCategorySelect(state, index))
+        self.add_item(FactionSelect(state, index))
+
+    @discord.ui.button(
+        label="Zurück",
+        style=discord.ButtonStyle.secondary
+    )
+    async def previous_player(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if self.index == 0:
+            await interaction.response.send_message(
+                "Du bist bereits beim ersten Spieler.",
+                ephemeral=True
+            )
+            return
+
+        new_index = self.index - 1
+
+        await interaction.response.edit_message(
+            content=build_player_detail_content(self.state, new_index),
+            view=PlayerDetailView(self.state, new_index)
+        )
+
+    @discord.ui.button(
+        label="Weiter",
+        style=discord.ButtonStyle.primary
+    )
+    async def next_player(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        player_name = self.state.participants[self.index]
+        detail = ensure_player_detail(self.state, player_name)
+
+        if not detail["vp_selected"]:
+            await interaction.response.send_message(
+                "Bitte VP auswählen. Wenn VP unbekannt sind, wähle 'Unbekannt / leer'.",
+                ephemeral=True
+            )
+            return
+
+        if not detail["faction"]:
+            await interaction.response.send_message(
+                "Bitte ein Volk auswählen.",
+                ephemeral=True
+            )
+            return
+
+        next_index = self.index + 1
 
         if next_index < len(self.state.participants):
-            await interaction.response.send_modal(
-                PlayerDetailsModal(self.state, start_index=next_index)
+            await interaction.response.edit_message(
+                content=build_player_detail_content(self.state, next_index),
+                view=PlayerDetailView(self.state, next_index)
             )
             return
 
         embed = build_preview_embed(self.state)
         view = ConfirmGameView(self.state)
 
-        await interaction.response.send_message(
-            "Schritt 5: Bitte prüfe die Vorschau.",
+        await interaction.response.edit_message(
+            content="Schritt 5: Bitte prüfe die Vorschau.",
             embed=embed,
-            view=view,
-            ephemeral=True
+            view=view
         )
 
 
@@ -1321,6 +1720,52 @@ async def add_game(interaction: discord.Interaction):
     await interaction.response.send_modal(
         BasicGameModal(state)
     )
+
+
+# =========================================================
+# 👤 /siegtabelle add_player
+# =========================================================
+@siegtabelle.command(
+    name="add_player",
+    description="Fügt einen neuen Spieler zur Auswahlliste hinzu"
+)
+@app_commands.describe(name="Name des neuen Spielers")
+async def add_player(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        success, message = add_botdata_player(name)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Fehler beim Hinzufügen des Spielers:\n```text\n{e}\n```",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(message, ephemeral=True)
+
+
+# =========================================================
+# 🪐 /siegtabelle add_faction
+# =========================================================
+@siegtabelle.command(
+    name="add_faction",
+    description="Fügt ein neues Volk zur Auswahlliste hinzu"
+)
+@app_commands.describe(name="Name des neuen Volks")
+async def add_faction(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        success, message = add_botdata_faction(name)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Fehler beim Hinzufügen des Volks:\n```text\n{e}\n```",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(message, ephemeral=True)
 
 
 # =========================================================
