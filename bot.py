@@ -40,6 +40,8 @@ BOTDATA_SHEET_NAME = "BotData"
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
 
+BOT_BUILD = "factions-mobile-external-v3"
+
 # =========================================================
 # 🤖 DISCORD SETUP
 # =========================================================
@@ -195,10 +197,11 @@ DEFAULT_POINTS = [
 DEFAULT_EXPANSIONS = [
     "Basis",
     "PoK",
-    "TE"
+    "PoK + TE"
 ]
 
 DEFAULT_MODIFICATIONS = [
+    "Standard",
     "Hidden Agenda",
     "Twilights Fall",
     "Absols Agendas",
@@ -316,6 +319,66 @@ def canonical_faction(faction: str) -> str:
     key = faction.lower()
 
     return FACTION_CANONICAL.get(key, faction)
+
+
+def canonical_expansion(expansion: str) -> str:
+    expansion = clean_text(expansion)
+
+    if not expansion:
+        return ""
+
+    key = normalize_name(expansion).replace(" ", "")
+
+    if key in {"te", "te+pok", "pok+te"}:
+        return "PoK + TE"
+
+    if key == "pok":
+        return "PoK"
+
+    if key == "basis":
+        return "Basis"
+
+    return expansion
+
+
+def normalize_selected_expansions(values):
+    result = []
+    has_pok_te = False
+
+    for value in values:
+        expansion = canonical_expansion(value)
+
+        if not expansion:
+            continue
+
+        if normalize_name(expansion) == "pok + te":
+            has_pok_te = True
+            continue
+
+        result.append(expansion)
+
+    if has_pok_te:
+        result = [
+            expansion for expansion in result
+            if normalize_name(expansion) != "pok"
+        ]
+        result.append("PoK + TE")
+
+    return unique_preserve_order(result)
+
+
+def split_expansion_cell(value: str):
+    value = clean_text(value)
+
+    if not value:
+        return []
+
+    if normalize_name(canonical_expansion(value)) == "pok + te":
+        return ["PoK + TE"]
+
+    parts = [part.strip() for part in value.split("+")]
+
+    return normalize_selected_expansions(parts)
 
 
 def parse_number(value):
@@ -645,6 +708,12 @@ def add_botdata_points(value: str):
 
 
 def add_botdata_expansion(value: str):
+    normalized_values = normalize_selected_expansions([value])
+
+    if not normalized_values:
+        return False, "Leerer Eintrag."
+
+    value = normalized_values[0]
     existing = get_expansion_options()
 
     if normalize_name(value) in [normalize_name(v) for v in existing]:
@@ -671,10 +740,20 @@ def get_points_options():
 
 
 def get_expansion_options():
+    values = []
+
+    values.extend(DEFAULT_EXPANSIONS)
+
+    for value in get_unique_sheet_column_values("Erweiterung"):
+        values.extend(split_expansion_cell(value))
+
+    for value in get_botdata_column_values(BOTDATA_COL_EXPANSION):
+        values.extend(split_expansion_cell(value))
+
     return unique_preserve_order(
-        DEFAULT_EXPANSIONS
-        + get_unique_sheet_column_values("Erweiterung", split_multi=True)
-        + get_botdata_column_values(BOTDATA_COL_EXPANSION)
+        canonical_expansion(value)
+        for value in values
+        if canonical_expansion(value)
     )
 
 
@@ -685,7 +764,7 @@ def get_modification_options():
         + get_botdata_column_values(BOTDATA_COL_MODIFICATION)
     )
 
-    return [
+    filtered_values = [
         value for value in values
         if normalize_name(value) not in {
             "nein",
@@ -693,17 +772,40 @@ def get_modification_options():
         }
     ]
 
+    non_standard_values = [
+        value for value in filtered_values
+        if normalize_name(value) != "standard"
+    ]
+
+    return unique_preserve_order(["Standard"] + non_standard_values)
 
 def clean_selected_values(values):
     return unique_preserve_order(values)
 
 
+def clean_selected_modifications(values):
+    cleaned = unique_preserve_order(values)
+
+    if len(cleaned) > 1:
+        cleaned = [
+            value for value in cleaned
+            if normalize_name(value) != "standard"
+        ]
+
+    return cleaned
+
+
 def format_expansions_for_sheet(state):
-    return " + ".join(state.erweiterungen)
+    return " + ".join(normalize_selected_expansions(state.erweiterungen))
 
 
 def format_modifications_for_sheet(state):
-    return " + ".join(state.modifikationen)
+    modifications = clean_selected_modifications(state.modifikationen)
+
+    if not modifications:
+        return "Standard"
+
+    return " + ".join(modifications)
 
 
 def get_all_player_names_cached(force_refresh=False):
@@ -875,6 +977,55 @@ def build_multi_select_options_with_add_first(values, selected_values, add_label
             seen.add(key)
 
         if len(visible_values) >= 24:
+            break
+
+    for value in visible_values:
+        options.append(
+            discord.SelectOption(
+                label=value,
+                value=value,
+                default=normalize_name(value) in selected_keys
+            )
+        )
+
+    return options[:25]
+
+
+def build_modification_select_options(values, selected_values, add_label):
+    selected_values = clean_selected_modifications(selected_values or [])
+    selected_keys = {normalize_name(value) for value in selected_values}
+    standard_selected = not selected_values or "standard" in selected_keys
+
+    options = [
+        discord.SelectOption(
+            label=add_label,
+            value="__add__"
+        ),
+        discord.SelectOption(
+            label="Standard",
+            value="Standard",
+            default=standard_selected
+        )
+    ]
+
+    visible_values = []
+    seen = {"standard"}
+
+    for value in selected_values:
+        key = normalize_name(value)
+
+        if key not in seen:
+            visible_values.append(value)
+            seen.add(key)
+
+    for value in values:
+        key = normalize_name(value)
+
+        if key not in seen:
+            visible_values.append(value)
+            seen.add(key)
+
+        if len(visible_values) >= 23:
             break
 
     for value in visible_values:
@@ -1173,7 +1324,11 @@ def get_faction_stats():
                 }
 
             faction_stats[faction]["games"] += 1
-            faction_stats[faction]["players"][player_name] += 1
+
+            # Externe Spieler sollen für Spiele und Winrate berücksichtigt werden,
+            # aber nicht als Top-Spieler in den Fraktionsstatistiken erscheinen.
+            if not is_external_player_name(player_name):
+                faction_stats[faction]["players"][player_name] += 1
 
             if winner_name and normalize_player_name(player_name) == winner_name:
                 faction_stats[faction]["wins"] += 1
@@ -1218,10 +1373,12 @@ def get_faction_stats():
 
 
 def build_faction_table(stats):
-    header = f"{'Volk':<16} {'Spiele':>6} {'Winrate':>8}  Top-Spieler"
-    divider = "-" * len(header)
-
-    lines = [header, divider]
+    """
+    Mobilfreundliche Darstellung der Fraktionsstatistiken.
+    Keine Monospace-Tabelle mehr, damit Discord auf Mobilgeräten keine
+    schwer lesbaren Spaltenumbrüche erzeugt.
+    """
+    lines = []
 
     for row in stats:
         faction = row["faction"]
@@ -1234,15 +1391,20 @@ def build_faction_table(stats):
             top_players = top_players[:21] + "..."
 
         if row["top_count"] >= 2 and top_players:
-            top_text = f"{top_players} ({row['top_count']}x)"
+            top_text = f"{top_players}×{row['top_count']}"
         else:
             top_text = "-"
 
         lines.append(
-            f"{faction:<16} {games:>6} {winrate:>8}  {top_text}"
+            f"**{faction}** · {games} Sp. · {winrate} WR · Top: {top_text}"
         )
 
-    return "```text\n" + "\n".join(lines) + "\n```"
+    text = "\n".join(lines)
+
+    if len(text) > 3900:
+        text = text[:3900].rstrip() + "\n…"
+
+    return text
 
 
 # =========================================================
@@ -1353,7 +1515,7 @@ def build_preview_embed(state: AddGameState):
     winner_text = state.winner if state.winner else "Kein Gewinner / abgebrochen"
     community_text = ", ".join(state.community_awards) if state.community_awards else "-"
     expansion_text = format_expansions_for_sheet(state) if state.erweiterungen else "-"
-    modification_text = format_modifications_for_sheet(state) if state.modifikationen else "-"
+    modification_text = format_modifications_for_sheet(state)
 
     embed = discord.Embed(
         title="Vorschau: Neues Spiel",
@@ -1398,6 +1560,9 @@ def build_preview_embed(state: AddGameState):
 
 
 def append_game_to_sheet(state: AddGameState):
+    state.erweiterungen = normalize_selected_expansions(state.erweiterungen)
+    state.modifikationen = clean_selected_modifications(state.modifikationen)
+
     player_cell = build_player_cell_from_state(state)
     community_cell = ", ".join(state.community_awards)
     winner_cell = state.winner if state.winner else ""
@@ -1590,7 +1755,7 @@ class ExpansionSelect(discord.ui.Select):
             if value != "__add__"
         ]
 
-        self.state.erweiterungen = clean_selected_values(selected)
+        self.state.erweiterungen = normalize_selected_expansions(selected)
 
         if "__add__" in self.values:
             await interaction.response.send_modal(
@@ -1608,7 +1773,7 @@ class ModificationSelect(discord.ui.Select):
     def __init__(self, state: AddGameState):
         self.state = state
 
-        options = build_multi_select_options_with_add_first(
+        options = build_modification_select_options(
             get_modification_options(),
             state.modifikationen,
             "Neue Modifikation eintragen"
@@ -1627,7 +1792,7 @@ class ModificationSelect(discord.ui.Select):
             if value != "__add__"
         ]
 
-        self.state.modifikationen = clean_selected_values(selected)
+        self.state.modifikationen = clean_selected_modifications(selected)
 
         if "__add__" in self.values:
             await interaction.response.send_modal(
@@ -1687,6 +1852,16 @@ class CustomSettingModal(discord.ui.Modal):
             label = "Punkte"
 
         elif self.setting_type == "expansion":
+            normalized_expansion_values = normalize_selected_expansions([value])
+
+            if not normalized_expansion_values:
+                await interaction.response.send_message(
+                    "Leerer Eintrag.",
+                    ephemeral=True
+                )
+                return
+
+            value = normalized_expansion_values[0]
             add_botdata_expansion(value)
 
             current = [
@@ -1695,7 +1870,7 @@ class CustomSettingModal(discord.ui.Modal):
             ]
 
             current.append(value)
-            self.state.erweiterungen = clean_selected_values(current)
+            self.state.erweiterungen = normalize_selected_expansions(current)
             label = "Erweiterung"
 
         else:
@@ -1707,7 +1882,7 @@ class CustomSettingModal(discord.ui.Modal):
             ]
 
             current.append(value)
-            self.state.modifikationen = clean_selected_values(current)
+            self.state.modifikationen = clean_selected_modifications(current)
             label = "Modifikation"
 
         await interaction.response.send_message(
@@ -1747,6 +1922,13 @@ class GameSettingsSelectionView(OwnerOnlyView):
                 ephemeral=True
             )
             return
+
+        self.state.erweiterungen = normalize_selected_expansions(self.state.erweiterungen)
+
+        if not self.state.modifikationen:
+            self.state.modifikationen = ["Standard"]
+        else:
+            self.state.modifikationen = clean_selected_modifications(self.state.modifikationen)
 
         player_names = get_all_player_names_cached()
         view = PlayerAsyncSelectionView(self.state, player_names)
@@ -2627,7 +2809,7 @@ async def factions(interaction: discord.Interaction):
     )
 
     embed.set_footer(
-        text="Sortiert nach Anzahl der Spiele. Winrate = Siege / Spiele."
+        text=f"Sortiert nach Spielen. WR = Siege / Spiele. Externe zählen nicht als Top-Spieler. Build: {BOT_BUILD}"
     )
 
     await interaction.followup.send(embed=embed)
