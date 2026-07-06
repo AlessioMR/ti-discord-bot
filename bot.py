@@ -36,6 +36,7 @@ gc = gspread.authorize(creds)
 # =========================================================
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
+BOT_BUILD = "multi-winners-external-filter-v6"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -199,6 +200,7 @@ DEFAULT_EXPANSIONS = [
 ]
 
 DEFAULT_MODIFICATIONS = [
+    "Standard",
     "Hidden Agenda",
     "Twilights Fall",
     "Absols Agendas",
@@ -412,15 +414,67 @@ def get_unique_sheet_column_values(column_name, split_multi=False):
     return unique_preserve_order(values)
 
 
-def split_community_names(entry: str):
+def split_player_names_cell(entry: str):
     if not entry:
         return []
 
-    return [
-        canonical_player_name(name.strip())
-        for name in str(entry).split(",")
-        if name.strip()
-    ]
+    names = []
+
+    for name in str(entry).split(","):
+        canonical = canonical_player_name(name.strip())
+
+        if canonical:
+            names.append(canonical)
+
+    return unique_preserve_order(names)
+
+
+def split_winner_names(entry: str):
+    return split_player_names_cell(entry)
+
+
+def split_community_names(entry: str):
+    return split_player_names_cell(entry)
+
+
+def is_countable_statistics_player(name: str) -> bool:
+    canonical = canonical_player_name(name)
+
+    if not canonical:
+        return False
+
+    if is_external_player_name(canonical):
+        return False
+
+    return True
+
+
+def normalize_expansion_values(values):
+    raw_values = []
+
+    for value in values or []:
+        for part in split_multi_value_cell(value):
+            raw_values.append(part)
+
+    raw_values = unique_preserve_order(raw_values)
+    keys = {normalize_name(value) for value in raw_values}
+
+    result = []
+
+    for value in raw_values:
+        key = normalize_name(value)
+
+        if key in {"te", "pok"}:
+            continue
+
+        result.append(value)
+
+    if "te" in keys:
+        result.extend(["PoK", "TE"])
+    elif "pok" in keys:
+        result.append("PoK")
+
+    return unique_preserve_order(result)
 
 
 def split_game_entries(raw: str):
@@ -671,7 +725,7 @@ def get_points_options():
 
 
 def get_expansion_options():
-    return unique_preserve_order(
+    return normalize_expansion_values(
         DEFAULT_EXPANSIONS
         + get_unique_sheet_column_values("Erweiterung", split_multi=True)
         + get_botdata_column_values(BOTDATA_COL_EXPANSION)
@@ -680,12 +734,13 @@ def get_expansion_options():
 
 def get_modification_options():
     values = unique_preserve_order(
-        DEFAULT_MODIFICATIONS
+        ["Standard"]
+        + DEFAULT_MODIFICATIONS
         + get_unique_sheet_column_values("Modifikation", split_multi=True)
         + get_botdata_column_values(BOTDATA_COL_MODIFICATION)
     )
 
-    return [
+    filtered = [
         value for value in values
         if normalize_name(value) not in {
             "nein",
@@ -693,17 +748,32 @@ def get_modification_options():
         }
     ]
 
+    standard = next(
+        (value for value in filtered if normalize_name(value) == "standard"),
+        "Standard"
+    )
+
+    rest = [
+        value for value in filtered
+        if normalize_name(value) != "standard"
+    ]
+
+    return [standard] + rest
+
 
 def clean_selected_values(values):
     return unique_preserve_order(values)
 
 
 def format_expansions_for_sheet(state):
-    return " + ".join(state.erweiterungen)
+    return " + ".join(normalize_expansion_values(state.erweiterungen))
 
 
 def format_modifications_for_sheet(state):
-    return " + ".join(state.modifikationen)
+    if not state.modifikationen:
+        return "Standard"
+
+    return " + ".join(clean_selected_values(state.modifikationen))
 
 
 def get_all_player_names_cached(force_refresh=False):
@@ -725,9 +795,9 @@ def get_all_player_names_cached(force_refresh=False):
             names.add(player_name)
 
     for row in rows:
-        winner = canonical_player_name(row.get("Gewinner", ""))
-        if winner and not is_excluded_from_player_dropdown(winner):
-            names.add(winner)
+        for winner in split_winner_names(row.get("Gewinner", "")):
+            if winner and not is_excluded_from_player_dropdown(winner):
+                names.add(winner)
 
         for community_name in split_community_names(row.get("Community Preis")):
             if community_name and not is_excluded_from_player_dropdown(community_name):
@@ -916,11 +986,14 @@ def get_target_points(row, players):
     if points_from_sheet and points_from_sheet > 0:
         return points_from_sheet
 
-    winner = normalize_player_name(row.get("Gewinner", ""))
+    winner_names = {
+        normalize_player_name(winner)
+        for winner in split_winner_names(row.get("Gewinner", ""))
+    }
 
-    if winner:
+    if winner_names:
         for player in players:
-            if normalize_player_name(player["name"]) == winner and player["vp"]:
+            if normalize_player_name(player["name"]) in winner_names and player["vp"]:
                 return player["vp"]
 
     return None
@@ -1008,10 +1081,9 @@ def get_halloffame():
     winners = []
 
     for row in rows:
-        winner = canonical_player_name(row.get("Gewinner"))
-
-        if winner and str(winner).strip():
-            winners.append(winner)
+        for winner in split_winner_names(row.get("Gewinner")):
+            if is_countable_statistics_player(winner):
+                winners.append(canonical_player_name(winner))
 
     counts = Counter(winners)
     sorted_data = counts.most_common()
@@ -1044,7 +1116,8 @@ def get_community():
 
     for row in rows:
         for name in split_community_names(row.get("Community Preis")):
-            players.append(name)
+            if is_countable_statistics_player(name):
+                players.append(canonical_player_name(name))
 
     return Counter(players)
 
@@ -1085,9 +1158,14 @@ def get_player_stats(name: str):
                 player_entry = player
                 break
 
-        winner_name = normalize_player_name(row.get("Gewinner", ""))
+        winner_names = {
+            normalize_player_name(winner)
+            for winner in split_winner_names(row.get("Gewinner", ""))
+        }
 
-        if winner_name == search_name:
+        player_won = search_name in winner_names
+
+        if player_won:
             wins += 1
 
         for community_name in split_community_names(row.get("Community Preis")):
@@ -1104,7 +1182,7 @@ def get_player_stats(name: str):
 
         factions_played[faction] += 1
 
-        if winner_name == search_name:
+        if player_won:
             faction_wins[faction] += 1
 
         if vp is not None:
@@ -1159,7 +1237,10 @@ def get_faction_stats():
         if not players:
             continue
 
-        winner_name = normalize_player_name(row.get("Gewinner", ""))
+        winner_names = {
+            normalize_player_name(winner)
+            for winner in split_winner_names(row.get("Gewinner", ""))
+        }
 
         for player in players:
             faction = player["faction"] or "Unbekannt"
@@ -1173,9 +1254,11 @@ def get_faction_stats():
                 }
 
             faction_stats[faction]["games"] += 1
-            faction_stats[faction]["players"][player_name] += 1
 
-            if winner_name and normalize_player_name(player_name) == winner_name:
+            if not is_external_player_name(player_name):
+                faction_stats[faction]["players"][player_name] += 1
+
+            if winner_names and normalize_player_name(player_name) in winner_names:
                 faction_stats[faction]["wins"] += 1
 
     result = []
@@ -1218,7 +1301,8 @@ def get_faction_stats():
 
 
 def build_faction_table(stats):
-    header = f"{'Volk':<16} {'Spiele':>6} {'Winrate':>8}  Top-Spieler"
+    faction_width = 14
+    header = f"{'Volk':<{faction_width}}{'Spiele':>6} {'Winrate':>8}  Top-Spieler"
     divider = "-" * len(header)
 
     lines = [header, divider]
@@ -1239,7 +1323,7 @@ def build_faction_table(stats):
             top_text = "-"
 
         lines.append(
-            f"{faction:<16} {games:>6} {winrate:>8}  {top_text}"
+            f"{faction:<{faction_width}}{games:>6} {winrate:>8}  {top_text}"
         )
 
     return "```text\n" + "\n".join(lines) + "\n```"
@@ -1258,7 +1342,7 @@ class AddGameState:
     kommentare: str = ""
     async_value: str = ""
     participants: list = field(default_factory=list)
-    winner: str = ""
+    winners: list = field(default_factory=list)
     winner_selected: bool = False
     community_awards: list = field(default_factory=list)
     player_details: dict = field(default_factory=dict)
@@ -1350,10 +1434,10 @@ def build_player_cell_from_state(state: AddGameState):
 def build_preview_embed(state: AddGameState):
     player_cell = build_player_cell_from_state(state)
 
-    winner_text = state.winner if state.winner else "Kein Gewinner / abgebrochen"
+    winner_text = ", ".join(state.winners) if state.winners else "Kein Gewinner / abgebrochen"
     community_text = ", ".join(state.community_awards) if state.community_awards else "-"
     expansion_text = format_expansions_for_sheet(state) if state.erweiterungen else "-"
-    modification_text = format_modifications_for_sheet(state) if state.modifikationen else "-"
+    modification_text = format_modifications_for_sheet(state)
 
     embed = discord.Embed(
         title="Vorschau: Neues Spiel",
@@ -1400,7 +1484,7 @@ def build_preview_embed(state: AddGameState):
 def append_game_to_sheet(state: AddGameState):
     player_cell = build_player_cell_from_state(state)
     community_cell = ", ".join(state.community_awards)
-    winner_cell = state.winner if state.winner else ""
+    winner_cell = ", ".join(state.winners)
     expansion_cell = format_expansions_for_sheet(state)
     modification_cell = format_modifications_for_sheet(state)
 
@@ -1590,7 +1674,7 @@ class ExpansionSelect(discord.ui.Select):
             if value != "__add__"
         ]
 
-        self.state.erweiterungen = clean_selected_values(selected)
+        self.state.erweiterungen = normalize_expansion_values(selected)
 
         if "__add__" in self.values:
             await interaction.response.send_modal(
@@ -1695,7 +1779,7 @@ class CustomSettingModal(discord.ui.Modal):
             ]
 
             current.append(value)
-            self.state.erweiterungen = clean_selected_values(current)
+            self.state.erweiterungen = normalize_expansion_values(current)
             label = "Erweiterung"
 
         else:
@@ -1747,6 +1831,13 @@ class GameSettingsSelectionView(OwnerOnlyView):
                 ephemeral=True
             )
             return
+
+        self.state.erweiterungen = normalize_expansion_values(self.state.erweiterungen)
+
+        if not self.state.modifikationen:
+            self.state.modifikationen = ["Standard"]
+        else:
+            self.state.modifikationen = clean_selected_values(self.state.modifikationen)
 
         player_names = get_all_player_names_cached()
         view = PlayerAsyncSelectionView(self.state, player_names)
@@ -2008,7 +2099,7 @@ class PlayerAsyncSelectionView(OwnerOnlyView):
         view = WinnerCommunitySelectionView(self.state)
 
         await interaction.response.edit_message(
-            content="Schritt 3: Wähle Gewinner und Community Preis.",
+            content="Schritt 3: Wähle einen oder mehrere Gewinner und Community Preis.",
             view=view
         )
 
@@ -2021,7 +2112,7 @@ class WinnerSelect(discord.ui.Select):
             discord.SelectOption(
                 label="Kein Gewinner / abgebrochen",
                 value="__none__",
-                default=state.winner_selected and state.winner == ""
+                default=state.winner_selected and not state.winners
             )
         ]
 
@@ -2029,25 +2120,23 @@ class WinnerSelect(discord.ui.Select):
             discord.SelectOption(
                 label=name,
                 value=name,
-                default=state.winner == name
+                default=name in state.winners
             )
             for name in state.participants
         ])
 
         super().__init__(
-            placeholder="Gewinner auswählen",
+            placeholder="Gewinner auswählen, mehrere möglich",
             min_values=1,
-            max_values=1,
+            max_values=len(options),
             options=options
         )
 
     async def callback(self, interaction: discord.Interaction):
-        value = self.values[0]
-
-        if value == "__none__":
-            self.state.winner = ""
+        if "__none__" in self.values:
+            self.state.winners = []
         else:
-            self.state.winner = value
+            self.state.winners = list(self.values)
 
         self.state.winner_selected = True
 
@@ -2109,7 +2198,7 @@ class WinnerCommunitySelectionView(OwnerOnlyView):
     ):
         if not self.state.winner_selected:
             await interaction.response.send_message(
-                "Bitte einen Gewinner oder 'Kein Gewinner / abgebrochen' auswählen.",
+                "Bitte mindestens einen Gewinner oder 'Kein Gewinner / abgebrochen' auswählen.",
                 ephemeral=True
             )
             return
@@ -2480,6 +2569,9 @@ async def halloffame(interaction: discord.Interaction):
 
         text += f"{medal} **{player}** — {format_count_sieg(wins)}\n"
 
+    if not text:
+        text = "Keine Daten"
+
     embed = discord.Embed(
         title="🏆 Hall of Fame",
         description=text,
@@ -2519,6 +2611,9 @@ async def siegerderherzen(interaction: discord.Interaction):
             medal_index += 1
 
         text += f"{medal} **{player}** — {format_count_preis(count)}\n"
+
+    if not text:
+        text = "Keine Daten"
 
     embed = discord.Embed(
         title="❤️ Sieger der Herzen",
@@ -2627,7 +2722,7 @@ async def factions(interaction: discord.Interaction):
     )
 
     embed.set_footer(
-        text="Sortiert nach Anzahl der Spiele. Winrate = Siege / Spiele."
+        text=f"Sortiert nach Anzahl der Spiele. Winrate = Siege / Spiele. Build: {BOT_BUILD}"
     )
 
     await interaction.followup.send(embed=embed)
