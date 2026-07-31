@@ -1,16 +1,19 @@
 import discord
 from discord import app_commands
+from discord.ext import tasks
 import gspread
 from gspread.exceptions import WorksheetNotFound
 from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import os
 import json
 import re
 import time
+import uuid
 
 # =========================================================
 # 🔐 DISCORD TOKEN
@@ -36,7 +39,8 @@ gc = gspread.authorize(creds)
 # =========================================================
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
-BOT_BUILD = "multi-winners-external-filter-v6"
+SESSIONS_SHEET_NAME = "Sessions"
+BOT_BUILD = "sessions-reminders-v1"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -58,8 +62,14 @@ siegtabelle = app_commands.Group(
     description="Siegtabelle verwalten"
 )
 
+session = app_commands.Group(
+    name="session",
+    description="Spieltermine und Erinnerungen verwalten"
+)
+
 tree.add_command(statistics)
 tree.add_command(siegtabelle)
+tree.add_command(session)
 
 # =========================================================
 # 🧠 CONSTANTS / HELPERS
@@ -2544,6 +2554,763 @@ class ConfirmGameView(OwnerOnlyView):
 
 
 # =========================================================
+# 📅 SESSION / REMINDER SYSTEM
+# =========================================================
+SESSION_TIMEZONE = ZoneInfo("Europe/Berlin")
+DEFAULT_SESSION_REMINDER_DAYS = [3, 1]
+SESSION_HEADERS = [
+    "SessionID",
+    "GuildID",
+    "ChannelID",
+    "CreatorID",
+    "Title",
+    "StartUTC",
+    "Location",
+    "ParticipantIDs",
+    "ReminderDays",
+    "SentReminderDays",
+    "Status",
+    "CreatedAt",
+    "EventID"
+]
+
+GERMAN_WEEKDAYS = [
+    "Montag",
+    "Dienstag",
+    "Mittwoch",
+    "Donnerstag",
+    "Freitag",
+    "Samstag",
+    "Sonntag"
+]
+
+GERMAN_MONTHS = [
+    "Januar",
+    "Februar",
+    "März",
+    "April",
+    "Mai",
+    "Juni",
+    "Juli",
+    "August",
+    "September",
+    "Oktober",
+    "November",
+    "Dezember"
+]
+
+
+@dataclass
+class SessionDraft:
+    owner_id: int
+    guild_id: int
+    channel_id: int
+    title: str
+    start_utc: datetime
+    location: str
+    reminder_days: list[int]
+
+
+def get_sessions_sheet(create=False):
+    try:
+        worksheet = spreadsheet.worksheet(SESSIONS_SHEET_NAME)
+    except WorksheetNotFound:
+        if not create:
+            return None
+
+        worksheet = spreadsheet.add_worksheet(
+            title=SESSIONS_SHEET_NAME,
+            rows=500,
+            cols=len(SESSION_HEADERS)
+        )
+        worksheet.update(
+            f"A1:{rowcol_to_a1(1, len(SESSION_HEADERS))}",
+            [SESSION_HEADERS]
+        )
+        return worksheet
+
+    first_row = worksheet.row_values(1)
+
+    if not first_row:
+        worksheet.update(
+            f"A1:{rowcol_to_a1(1, len(SESSION_HEADERS))}",
+            [SESSION_HEADERS]
+        )
+    elif first_row[:len(SESSION_HEADERS)] != SESSION_HEADERS:
+        raise RuntimeError(
+            f"Das Tabellenblatt '{SESSIONS_SHEET_NAME}' hat unerwartete Spalten. "
+            "Bitte die Kopfzeile nicht manuell verändern."
+        )
+
+    return worksheet
+
+
+def parse_session_datetime(date_value: str, time_value: str) -> datetime:
+    date_value = str(date_value).strip()
+    time_value = str(time_value).strip()
+
+    parsed_date = None
+    for date_format in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            parsed_date = datetime.strptime(date_value, date_format).date()
+            break
+        except ValueError:
+            continue
+
+    if parsed_date is None:
+        raise ValueError("Ungültiges Datum. Nutze `TT.MM.JJJJ`, z.B. `08.08.2026`.")
+
+    try:
+        parsed_time = datetime.strptime(time_value, "%H:%M").time()
+    except ValueError as exc:
+        raise ValueError("Ungültige Uhrzeit. Nutze `HH:MM`, z.B. `09:00`.") from exc
+
+    local_datetime = datetime.combine(
+        parsed_date,
+        parsed_time,
+        tzinfo=SESSION_TIMEZONE
+    )
+
+    if local_datetime <= datetime.now(SESSION_TIMEZONE):
+        raise ValueError("Der Termin muss in der Zukunft liegen.")
+
+    return local_datetime.astimezone(timezone.utc)
+
+
+def parse_reminder_days(value: str) -> list[int]:
+    value = str(value).strip().lower()
+
+    if value in {"", "keine", "none", "-"}:
+        return []
+
+    raw_values = [part for part in re.split(r"[,;\s]+", value) if part]
+    reminder_days = []
+
+    for raw_value in raw_values:
+        try:
+            day = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                "Erinnerungen müssen als Tage angegeben werden, z.B. `3, 1`."
+            ) from exc
+
+        if day < 0 or day > 30:
+            raise ValueError("Erinnerungstage müssen zwischen 0 und 30 liegen.")
+
+        if day not in reminder_days:
+            reminder_days.append(day)
+
+    return sorted(reminder_days, reverse=True)
+
+
+def serialize_number_list(values) -> str:
+    return ",".join(str(int(value)) for value in values)
+
+
+def parse_number_list(value: str) -> list[int]:
+    result = []
+
+    for part in re.split(r"[,;\s]+", str(value).strip()):
+        if not part:
+            continue
+        try:
+            result.append(int(part))
+        except ValueError:
+            continue
+
+    return result
+
+
+def session_datetime_from_record(record) -> datetime:
+    value = str(record.get("StartUTC", "")).strip()
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
+
+
+def format_session_date_de(start_utc: datetime) -> str:
+    local_start = start_utc.astimezone(SESSION_TIMEZONE)
+    return (
+        f"{GERMAN_WEEKDAYS[local_start.weekday()]}, "
+        f"{local_start.day}. {GERMAN_MONTHS[local_start.month - 1]} {local_start.year}"
+    )
+
+
+def format_days_until(start_utc: datetime) -> str:
+    today = datetime.now(SESSION_TIMEZONE).date()
+    session_date = start_utc.astimezone(SESSION_TIMEZONE).date()
+    days = (session_date - today).days
+
+    if days <= 0:
+        return "Heute ist der Termin!"
+    if days == 1:
+        return "Noch 1 Tag bis zum Termin!"
+    return f"Noch {days} Tage bis zum Termin!"
+
+
+def format_session_message(record, heading: str) -> str:
+    start_utc = session_datetime_from_record(record)
+    local_start = start_utc.astimezone(SESSION_TIMEZONE)
+    participant_ids = parse_number_list(record.get("ParticipantIDs", ""))
+    mentions = " ".join(f"<@{user_id}>" for user_id in participant_ids)
+
+    return (
+        f"⏰ **{heading}**\n"
+        f"{mentions}\n"
+        f"📅 {format_session_date_de(start_utc)}\n"
+        f"🕘 {local_start.strftime('%H:%M')} Uhr\n"
+        f"📍 Wir spielen bei **{record.get('Location', '-')}**\n"
+        f"⏳ {format_days_until(start_utc)}"
+    )
+
+
+def get_session_records(guild_id=None, active_only=False):
+    worksheet = get_sessions_sheet(create=False)
+
+    if worksheet is None:
+        return []
+
+    values = worksheet.get_all_values()
+
+    if len(values) < 2:
+        return []
+
+    headers = values[0]
+    records = []
+
+    for row_index, row in enumerate(values[1:], start=2):
+        padded_row = row + [""] * max(0, len(headers) - len(row))
+        record = dict(zip(headers, padded_row))
+        record["_row"] = row_index
+
+        if not str(record.get("SessionID", "")).strip():
+            continue
+
+        if guild_id is not None and str(record.get("GuildID")) != str(guild_id):
+            continue
+
+        if active_only and str(record.get("Status", "")).lower() != "active":
+            continue
+
+        records.append(record)
+
+    return records
+
+
+def append_session_record(record):
+    worksheet = get_sessions_sheet(create=True)
+    row = [record.get(header, "") for header in SESSION_HEADERS]
+    worksheet.append_row(row, value_input_option="RAW")
+    return len(worksheet.get_all_values())
+
+
+def update_session_record(row_number: int, updates: dict):
+    worksheet = get_sessions_sheet(create=True)
+    header_columns = {
+        header: index
+        for index, header in enumerate(SESSION_HEADERS, start=1)
+    }
+    cells = []
+
+    for key, value in updates.items():
+        column = header_columns.get(key)
+        if column is None:
+            continue
+        cells.append(gspread.Cell(row_number, column, str(value)))
+
+    if cells:
+        worksheet.update_cells(cells, value_input_option="RAW")
+
+
+def find_session_record(interaction: discord.Interaction, session_id: str = ""):
+    records = get_session_records(
+        guild_id=interaction.guild_id,
+        active_only=True
+    )
+
+    session_id = str(session_id or "").strip().lower()
+
+    if session_id:
+        for record in records:
+            if str(record.get("SessionID", "")).lower() == session_id:
+                return record
+        return None
+
+    channel_records = [
+        record for record in records
+        if str(record.get("ChannelID")) == str(interaction.channel_id)
+    ]
+
+    if not channel_records:
+        return None
+
+    channel_records.sort(key=session_datetime_from_record)
+    return channel_records[0]
+
+
+def can_manage_session(interaction: discord.Interaction, record) -> bool:
+    if str(record.get("CreatorID")) == str(interaction.user.id):
+        return True
+
+    permissions = getattr(interaction.user, "guild_permissions", None)
+    return bool(permissions and permissions.manage_events)
+
+
+def initial_sent_reminders(start_utc: datetime, reminder_days: list[int]) -> list[int]:
+    now_utc = datetime.now(timezone.utc)
+    return [
+        day for day in reminder_days
+        if start_utc - timedelta(days=day) <= now_utc
+    ]
+
+
+async def get_native_scheduled_event(guild, event_id):
+    if not guild or not event_id:
+        return None
+
+    try:
+        event_id = int(event_id)
+    except (TypeError, ValueError):
+        return None
+
+    cached_event = guild.get_scheduled_event(event_id)
+    if cached_event is not None:
+        return cached_event
+
+    try:
+        return await guild.fetch_scheduled_event(event_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+async def create_native_scheduled_event(guild, channel, record):
+    start_utc = session_datetime_from_record(record)
+    participant_ids = parse_number_list(record.get("ParticipantIDs", ""))
+    participant_text = " ".join(f"<@{user_id}>" for user_id in participant_ids)
+    description = (
+        f"Mecatol-West-Spieltermin in {channel.mention}.\n"
+        f"Teilnehmer: {participant_text}"
+    )
+
+    return await guild.create_scheduled_event(
+        name=str(record.get("Title", "Mecatol-West-Runde"))[:100],
+        description=description[:1000],
+        start_time=start_utc,
+        end_time=start_utc + timedelta(hours=12),
+        entity_type=discord.EntityType.external,
+        privacy_level=discord.PrivacyLevel.guild_only,
+        location=str(record.get("Location", "Mecatol West"))[:100],
+        reason="Session über MW_bot angelegt"
+    )
+
+
+async def send_session_channel_message(channel, record, heading: str):
+    await channel.send(
+        format_session_message(record, heading),
+        allowed_mentions=discord.AllowedMentions(
+            everyone=False,
+            roles=False,
+            users=True,
+            replied_user=False
+        )
+    )
+
+
+class SessionCreateModal(discord.ui.Modal, title="Neue Session anlegen"):
+    session_title = discord.ui.TextInput(
+        label="Name des Termins",
+        placeholder="z.B. TI4-Runde August",
+        required=True,
+        max_length=100
+    )
+    date_value = discord.ui.TextInput(
+        label="Datum",
+        placeholder="TT.MM.JJJJ, z.B. 08.08.2026",
+        required=True,
+        max_length=10
+    )
+    time_value = discord.ui.TextInput(
+        label="Uhrzeit",
+        placeholder="HH:MM, z.B. 09:00",
+        required=True,
+        max_length=5
+    )
+    location = discord.ui.TextInput(
+        label="Ort",
+        placeholder="z.B. Alessio",
+        required=True,
+        max_length=100
+    )
+    reminders = discord.ui.TextInput(
+        label="Erinnerungen (Tage vorher)",
+        placeholder="z.B. 3, 1 oder 'keine'",
+        default="3, 1",
+        required=False,
+        max_length=50
+    )
+
+    def __init__(self, owner_id: int, guild_id: int, channel_id: int):
+        super().__init__()
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            start_utc = parse_session_datetime(
+                self.date_value.value,
+                self.time_value.value
+            )
+            reminder_days = parse_reminder_days(self.reminders.value)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        draft = SessionDraft(
+            owner_id=self.owner_id,
+            guild_id=self.guild_id,
+            channel_id=self.channel_id,
+            title=str(self.session_title.value).strip(),
+            start_utc=start_utc,
+            location=str(self.location.value).strip(),
+            reminder_days=reminder_days
+        )
+
+        await interaction.response.send_message(
+            "Wähle jetzt alle Teilnehmer aus (maximal 8).",
+            view=SessionParticipantView(draft),
+            ephemeral=True
+        )
+
+
+class SessionParticipantSelect(discord.ui.UserSelect):
+    def __init__(self, draft: SessionDraft):
+        super().__init__(
+            placeholder="Teilnehmer auswählen",
+            min_values=1,
+            max_values=8
+        )
+        self.draft = draft
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.draft.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Vorgang gestartet hat, kann Teilnehmer auswählen.",
+                ephemeral=True
+            )
+            return
+
+        participants = [user for user in self.values if not user.bot]
+
+        if not participants:
+            await interaction.response.send_message(
+                "Bitte wähle mindestens einen menschlichen Teilnehmer aus.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        session_id = uuid.uuid4().hex[:8]
+        participant_ids = [user.id for user in participants]
+        sent_days = initial_sent_reminders(
+            self.draft.start_utc,
+            self.draft.reminder_days
+        )
+        record = {
+            "SessionID": session_id,
+            "GuildID": self.draft.guild_id,
+            "ChannelID": self.draft.channel_id,
+            "CreatorID": self.draft.owner_id,
+            "Title": self.draft.title,
+            "StartUTC": self.draft.start_utc.isoformat(),
+            "Location": self.draft.location,
+            "ParticipantIDs": serialize_number_list(participant_ids),
+            "ReminderDays": serialize_number_list(self.draft.reminder_days),
+            "SentReminderDays": serialize_number_list(sent_days),
+            "Status": "active",
+            "CreatedAt": datetime.now(timezone.utc).isoformat(),
+            "EventID": ""
+        }
+
+        try:
+            row_number = append_session_record(record)
+        except Exception as exc:
+            await interaction.followup.send(
+                f"Der Termin konnte nicht im Google Sheet gespeichert werden:\n```text\n{exc}\n```",
+                ephemeral=True
+            )
+            return
+
+        native_event_warning = ""
+
+        try:
+            native_event = await create_native_scheduled_event(
+                interaction.guild,
+                interaction.channel,
+                record
+            )
+            record["EventID"] = native_event.id
+            update_session_record(row_number, {"EventID": native_event.id})
+        except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
+            native_event_warning = (
+                "\nHinweis: Die Bot-Erinnerung ist aktiv, aber das native Discord-Event "
+                f"konnte nicht erstellt werden (`{type(exc).__name__}`). "
+                "Prüfe für den Bot die Berechtigung **Events verwalten**."
+            )
+
+        try:
+            await send_session_channel_message(
+                interaction.channel,
+                record,
+                "Termin angelegt!"
+            )
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                f"Der Termin wurde gespeichert, aber die Bestätigung konnte nicht gesendet werden: `{exc}`",
+                ephemeral=True
+            )
+            return
+
+        reminder_text = (
+            ", ".join(str(day) for day in self.draft.reminder_days)
+            if self.draft.reminder_days
+            else "keine"
+        )
+        await interaction.followup.send(
+            f"Session `{session_id}` wurde angelegt. Erinnerungen: **{reminder_text} Tage vorher**."
+            f"{native_event_warning}",
+            ephemeral=True
+        )
+
+
+class SessionParticipantView(discord.ui.View):
+    def __init__(self, draft: SessionDraft):
+        super().__init__(timeout=300)
+        self.draft = draft
+        self.add_item(SessionParticipantSelect(draft))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.draft.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Vorgang gestartet hat, kann diese Auswahl benutzen.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+
+class SessionEditModal(discord.ui.Modal):
+    def __init__(self, record):
+        super().__init__(title=f"Session {record['SessionID']} bearbeiten")
+        self.record = record
+        start_local = session_datetime_from_record(record).astimezone(SESSION_TIMEZONE)
+
+        self.session_title = discord.ui.TextInput(
+            label="Name des Termins",
+            default=str(record.get("Title", ""))[:100],
+            required=True,
+            max_length=100
+        )
+        self.date_value = discord.ui.TextInput(
+            label="Datum",
+            default=start_local.strftime("%d.%m.%Y"),
+            required=True,
+            max_length=10
+        )
+        self.time_value = discord.ui.TextInput(
+            label="Uhrzeit",
+            default=start_local.strftime("%H:%M"),
+            required=True,
+            max_length=5
+        )
+        self.location = discord.ui.TextInput(
+            label="Ort",
+            default=str(record.get("Location", ""))[:100],
+            required=True,
+            max_length=100
+        )
+        self.reminders = discord.ui.TextInput(
+            label="Erinnerungen (Tage vorher)",
+            default=str(record.get("ReminderDays", "")) or "keine",
+            required=False,
+            max_length=50
+        )
+
+        self.add_item(self.session_title)
+        self.add_item(self.date_value)
+        self.add_item(self.time_value)
+        self.add_item(self.location)
+        self.add_item(self.reminders)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not can_manage_session(interaction, self.record):
+            await interaction.response.send_message(
+                "Du darfst diese Session nicht bearbeiten.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            start_utc = parse_session_datetime(
+                self.date_value.value,
+                self.time_value.value
+            )
+            reminder_days = parse_reminder_days(self.reminders.value)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        old_start = session_datetime_from_record(self.record)
+        old_sent_days = set(parse_number_list(self.record.get("SentReminderDays", "")))
+
+        if start_utc != old_start:
+            sent_days = initial_sent_reminders(start_utc, reminder_days)
+        else:
+            sent_days = sorted(
+                old_sent_days.intersection(reminder_days).union(
+                    initial_sent_reminders(start_utc, reminder_days)
+                ),
+                reverse=True
+            )
+
+        updates = {
+            "Title": str(self.session_title.value).strip(),
+            "StartUTC": start_utc.isoformat(),
+            "Location": str(self.location.value).strip(),
+            "ReminderDays": serialize_number_list(reminder_days),
+            "SentReminderDays": serialize_number_list(sent_days)
+        }
+
+        try:
+            update_session_record(self.record["_row"], updates)
+        except Exception as exc:
+            await interaction.followup.send(
+                f"Die Session konnte nicht gespeichert werden:\n```text\n{exc}\n```",
+                ephemeral=True
+            )
+            return
+
+        self.record.update(updates)
+        native_event_warning = ""
+        native_event = await get_native_scheduled_event(
+            interaction.guild,
+            self.record.get("EventID")
+        )
+
+        if native_event is not None:
+            try:
+                await native_event.edit(
+                    name=updates["Title"][:100],
+                    start_time=start_utc,
+                    end_time=start_utc + timedelta(hours=12),
+                    location=updates["Location"][:100],
+                    reason="Session über MW_bot bearbeitet"
+                )
+            except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
+                native_event_warning = (
+                    f" Das native Discord-Event konnte nicht aktualisiert werden "
+                    f"(`{type(exc).__name__}`)."
+                )
+
+        try:
+            await send_session_channel_message(
+                interaction.channel,
+                self.record,
+                "Termin aktualisiert!"
+            )
+        except discord.HTTPException:
+            native_event_warning += " Die öffentliche Änderungsnachricht konnte nicht gesendet werden."
+
+        await interaction.followup.send(
+            f"Session `{self.record['SessionID']}` wurde aktualisiert.{native_event_warning}",
+            ephemeral=True
+        )
+
+
+async def resolve_session_channel(record):
+    try:
+        channel_id = int(record.get("ChannelID", 0))
+    except (TypeError, ValueError):
+        return None
+
+    channel = client.get_channel(channel_id)
+
+    if channel is not None:
+        return channel
+
+    try:
+        return await client.fetch_channel(channel_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+@tasks.loop(minutes=5)
+async def session_reminder_loop():
+    try:
+        records = get_session_records(active_only=True)
+    except Exception as exc:
+        print(f"Session-Reminder: Google-Sheet-Fehler: {exc}")
+        return
+
+    now_utc = datetime.now(timezone.utc)
+
+    for record in records:
+        try:
+            start_utc = session_datetime_from_record(record)
+        except (TypeError, ValueError):
+            print(f"Session-Reminder: Ungültige Startzeit in Session {record.get('SessionID')}")
+            continue
+
+        if start_utc <= now_utc:
+            try:
+                update_session_record(record["_row"], {"Status": "completed"})
+            except Exception as exc:
+                print(f"Session-Reminder: Status konnte nicht aktualisiert werden: {exc}")
+            continue
+
+        reminder_days = set(parse_number_list(record.get("ReminderDays", "")))
+        sent_days = set(parse_number_list(record.get("SentReminderDays", "")))
+        due_days = {
+            day for day in reminder_days - sent_days
+            if now_utc >= start_utc - timedelta(days=day)
+        }
+
+        if not due_days:
+            continue
+
+        channel = await resolve_session_channel(record)
+
+        if channel is None:
+            print(f"Session-Reminder: Kanal für Session {record.get('SessionID')} nicht gefunden")
+            continue
+
+        try:
+            await send_session_channel_message(
+                channel,
+                record,
+                "Termin Erinnerung!"
+            )
+            sent_days.update(due_days)
+            update_session_record(
+                record["_row"],
+                {"SentReminderDays": serialize_number_list(sorted(sent_days, reverse=True))}
+            )
+        except Exception as exc:
+            print(f"Session-Reminder: Versandfehler für {record.get('SessionID')}: {exc}")
+
+
+@session_reminder_loop.before_loop
+async def before_session_reminder_loop():
+    await client.wait_until_ready()
+
+
+# =========================================================
 # 🏆 /statistics halloffame
 # =========================================================
 @statistics.command(
@@ -2744,12 +3511,257 @@ async def add_game(interaction: discord.Interaction):
 
 
 # =========================================================
+# 📅 /session
+# =========================================================
+@session.command(
+    name="create",
+    description="Legt einen Termin mit Teilnehmern und Erinnerungen an"
+)
+@app_commands.guild_only()
+async def session_create(interaction: discord.Interaction):
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message(
+            "Dieser Befehl kann nur in einem Serverkanal verwendet werden.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_modal(
+        SessionCreateModal(
+            owner_id=interaction.user.id,
+            guild_id=interaction.guild.id,
+            channel_id=interaction.channel.id
+        )
+    )
+
+
+@session.command(
+    name="show",
+    description="Zeigt den nächsten Termin in diesem Kanal"
+)
+@app_commands.describe(session_id="Optionale Session-ID, falls mehrere Termine existieren")
+@app_commands.guild_only()
+async def session_show(
+    interaction: discord.Interaction,
+    session_id: str = ""
+):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        record = find_session_record(interaction, session_id)
+    except Exception as exc:
+        await interaction.followup.send(
+            f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
+            ephemeral=True
+        )
+        return
+
+    if record is None:
+        await interaction.followup.send(
+            "In diesem Kanal wurde keine aktive Session gefunden. "
+            "Bei mehreren Terminen kannst du eine Session-ID angeben.",
+            ephemeral=True
+        )
+        return
+
+    reminder_days = parse_number_list(record.get("ReminderDays", ""))
+    reminder_text = (
+        ", ".join(str(day) for day in reminder_days)
+        if reminder_days
+        else "keine"
+    )
+    content = (
+        f"**{record.get('Title', 'Mecatol-West-Runde')}** "
+        f"(ID: `{record.get('SessionID')}`)\n"
+        f"{format_session_message(record, 'Geplanter Termin')}\n"
+        f"🔔 Erinnerungen: **{reminder_text} Tage vorher**"
+    )
+
+    await interaction.followup.send(
+        content,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@session.command(
+    name="edit",
+    description="Bearbeitet Datum, Uhrzeit, Ort und Erinnerungen"
+)
+@app_commands.describe(session_id="Optionale Session-ID, falls mehrere Termine existieren")
+@app_commands.guild_only()
+async def session_edit(
+    interaction: discord.Interaction,
+    session_id: str = ""
+):
+    try:
+        record = find_session_record(interaction, session_id)
+    except Exception as exc:
+        await interaction.response.send_message(
+            f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
+            ephemeral=True
+        )
+        return
+
+    if record is None:
+        await interaction.response.send_message(
+            "In diesem Kanal wurde keine aktive Session gefunden.",
+            ephemeral=True
+        )
+        return
+
+    if not can_manage_session(interaction, record):
+        await interaction.response.send_message(
+            "Nur der Ersteller oder ein Mitglied mit **Events verwalten** darf diese Session bearbeiten.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_modal(SessionEditModal(record))
+
+
+@session.command(
+    name="cancel",
+    description="Sagt einen Termin ab und stoppt seine Erinnerungen"
+)
+@app_commands.describe(session_id="Optionale Session-ID, falls mehrere Termine existieren")
+@app_commands.guild_only()
+async def session_cancel(
+    interaction: discord.Interaction,
+    session_id: str = ""
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        record = find_session_record(interaction, session_id)
+    except Exception as exc:
+        await interaction.followup.send(
+            f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
+            ephemeral=True
+        )
+        return
+
+    if record is None:
+        await interaction.followup.send(
+            "In diesem Kanal wurde keine aktive Session gefunden.",
+            ephemeral=True
+        )
+        return
+
+    if not can_manage_session(interaction, record):
+        await interaction.followup.send(
+            "Nur der Ersteller oder ein Mitglied mit **Events verwalten** darf diese Session absagen.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        update_session_record(record["_row"], {"Status": "cancelled"})
+    except Exception as exc:
+        await interaction.followup.send(
+            f"Die Session konnte nicht abgesagt werden:\n```text\n{exc}\n```",
+            ephemeral=True
+        )
+        return
+
+    warning = ""
+    native_event = await get_native_scheduled_event(
+        interaction.guild,
+        record.get("EventID")
+    )
+
+    if native_event is not None:
+        try:
+            await native_event.cancel(reason="Session über MW_bot abgesagt")
+        except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
+            warning = f" Das native Discord-Event konnte nicht abgesagt werden (`{type(exc).__name__}`)."
+
+    try:
+        participant_ids = parse_number_list(record.get("ParticipantIDs", ""))
+        mentions = " ".join(f"<@{user_id}>" for user_id in participant_ids)
+        await interaction.channel.send(
+            f"❌ **Termin abgesagt!**\n{mentions}\n"
+            f"Der Termin **{record.get('Title', 'Mecatol-West-Runde')}** findet nicht statt.",
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                roles=False,
+                users=True,
+                replied_user=False
+            )
+        )
+    except discord.HTTPException:
+        warning += " Die öffentliche Absage konnte nicht gesendet werden."
+
+    await interaction.followup.send(
+        f"Session `{record['SessionID']}` wurde abgesagt.{warning}",
+        ephemeral=True
+    )
+
+
+@session.command(
+    name="remind",
+    description="Sendet jetzt manuell eine Erinnerung für den Termin"
+)
+@app_commands.describe(session_id="Optionale Session-ID, falls mehrere Termine existieren")
+@app_commands.guild_only()
+async def session_remind(
+    interaction: discord.Interaction,
+    session_id: str = ""
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        record = find_session_record(interaction, session_id)
+    except Exception as exc:
+        await interaction.followup.send(
+            f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
+            ephemeral=True
+        )
+        return
+
+    if record is None:
+        await interaction.followup.send(
+            "In diesem Kanal wurde keine aktive Session gefunden.",
+            ephemeral=True
+        )
+        return
+
+    if not can_manage_session(interaction, record):
+        await interaction.followup.send(
+            "Nur der Ersteller oder ein Mitglied mit **Events verwalten** darf Erinnerungen auslösen.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await send_session_channel_message(
+            interaction.channel,
+            record,
+            "Termin Erinnerung!"
+        )
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            f"Die Erinnerung konnte nicht gesendet werden: `{exc}`",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        f"Erinnerung für Session `{record['SessionID']}` wurde gesendet.",
+        ephemeral=True
+    )
+
+
+# =========================================================
 # 🚀 BOT START
 # =========================================================
 @client.event
 async def on_ready():
+    if not session_reminder_loop.is_running():
+        session_reminder_loop.start()
+
     await tree.sync()
-    print(f"Bot läuft als {client.user}")
+    print(f"Bot läuft als {client.user} | Build: {BOT_BUILD}")
 
 
 client.run(TOKEN)
