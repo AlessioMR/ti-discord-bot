@@ -40,7 +40,7 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "sessions-interaction-timeout-v4"
+BOT_BUILD = "sessions-native-edit-v5"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -3323,7 +3323,8 @@ class SessionEditModal(discord.ui.Modal):
             "StartUTC": start_utc.isoformat(),
             "Location": str(self.location.value).strip(),
             "ReminderDays": serialize_number_list(reminder_days),
-            "SentReminderDays": serialize_number_list(sent_days)
+            "SentReminderDays": serialize_number_list(sent_days),
+            "Status": "active"
         }
 
         try:
@@ -3372,6 +3373,104 @@ class SessionEditModal(discord.ui.Modal):
         )
 
 
+class NativeEventEditModal(discord.ui.Modal):
+    def __init__(self, record):
+        super().__init__(title="Discord-Event bearbeiten")
+        self.record = record
+        start_local = session_datetime_from_record(record).astimezone(SESSION_TIMEZONE)
+
+        self.session_title = discord.ui.TextInput(
+            label="Name des Termins",
+            default=str(record.get("Title", ""))[:100],
+            required=True,
+            max_length=100
+        )
+        self.date_value = discord.ui.TextInput(
+            label="Datum",
+            default=start_local.strftime("%d.%m.%Y"),
+            required=True,
+            max_length=10
+        )
+        self.time_value = discord.ui.TextInput(
+            label="Uhrzeit",
+            default=start_local.strftime("%H:%M"),
+            required=True,
+            max_length=5
+        )
+        self.location = discord.ui.TextInput(
+            label="Ort",
+            default=str(record.get("Location", ""))[:100],
+            required=True,
+            max_length=100
+        )
+
+        self.add_item(self.session_title)
+        self.add_item(self.date_value)
+        self.add_item(self.time_value)
+        self.add_item(self.location)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            start_utc = parse_session_datetime(
+                self.date_value.value,
+                self.time_value.value
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        native_event = await get_native_scheduled_event(
+            interaction.guild,
+            self.record.get("EventID")
+        )
+
+        if native_event is None:
+            await interaction.followup.send(
+                "Das Discord-Event wurde nicht mehr gefunden.",
+                ephemeral=True
+            )
+            return
+
+        title = str(self.session_title.value).strip()
+        location = str(self.location.value).strip()
+
+        try:
+            await native_event.edit(
+                name=title[:100],
+                start_time=start_utc,
+                end_time=start_utc + timedelta(hours=12),
+                location=location[:100],
+                reason="Discord-Event über MW_bot bearbeitet"
+            )
+        except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
+            await interaction.followup.send(
+                f"Das Discord-Event konnte nicht aktualisiert werden: `{exc}`",
+                ephemeral=True
+            )
+            return
+
+        self.record.update({
+            "Title": title,
+            "StartUTC": start_utc.isoformat(),
+            "Location": location
+        })
+
+        try:
+            await interaction.channel.send(
+                format_session_message(self.record, "Termin aktualisiert!"),
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.HTTPException:
+            pass
+
+        await interaction.followup.send(
+            "Das Discord-Event wurde aktualisiert. Für dieses ältere, nicht mit dem "
+            "Sessions-Sheet verknüpfte Event können keine Bot-Erinnerungen geändert werden.",
+            ephemeral=True
+        )
+
+
 def scheduled_event_to_session_record(event):
     location = str(getattr(event, "location", "") or "Discord-Event")
     creator_id = getattr(event, "creator_id", None) or ""
@@ -3394,7 +3493,10 @@ def scheduled_event_to_session_record(event):
     }
 
 
-async def get_cancellable_session_records(interaction: discord.Interaction):
+async def get_selectable_server_session_records(
+    interaction: discord.Interaction,
+    require_manage: bool
+):
     sheet_records = get_session_records(
         guild_id=interaction.guild_id,
         active_only=False
@@ -3434,17 +3536,21 @@ async def get_cancellable_session_records(interaction: discord.Interaction):
         session_key = f"session:{record.get('SessionID')}"
         selectable_by_key.pop(session_key, None)
 
-    manageable_records = [
-        record for record in selectable_by_key.values()
-        if can_manage_session(interaction, record)
-    ]
-    manageable_records.sort(
+    selectable_records = list(selectable_by_key.values())
+
+    if require_manage:
+        selectable_records = [
+            record for record in selectable_records
+            if can_manage_session(interaction, record)
+        ]
+
+    selectable_records.sort(
         key=lambda record: (
             str(record.get("ChannelID")) != str(interaction.channel_id),
             session_datetime_from_record(record)
         )
     )
-    return manageable_records[:25]
+    return selectable_records[:25]
 
 
 async def perform_session_cancellation(
@@ -3710,7 +3816,10 @@ class SessionActionSelect(discord.ui.Select):
             return
 
         if self.action == "edit":
-            await interaction.response.send_modal(SessionEditModal(record))
+            if record.get("_native_only"):
+                await interaction.response.send_modal(NativeEventEditModal(record))
+            else:
+                await interaction.response.send_modal(SessionEditModal(record))
             return
 
         if self.action == "remind":
@@ -3761,10 +3870,16 @@ async def open_session_action_picker(
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
-        records = get_session_records(
-            guild_id=interaction.guild_id,
-            active_only=True
-        )
+        if action in {"show", "edit"}:
+            records = await get_selectable_server_session_records(
+                interaction,
+                require_manage=require_manage
+            )
+        else:
+            records = get_session_records(
+                guild_id=interaction.guild_id,
+                active_only=True
+            )
     except Exception as exc:
         await interaction.edit_original_response(
             content=f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
@@ -3772,13 +3887,14 @@ async def open_session_action_picker(
         )
         return
 
-    if require_manage:
+    if require_manage and action == "remind":
         records = [
             record for record in records
             if can_manage_session(interaction, record)
         ]
 
-    records = prefer_current_channel_sessions(interaction, records)
+    if action == "remind":
+        records = prefer_current_channel_sessions(interaction, records)
 
     if not records:
         await interaction.edit_original_response(
@@ -4139,7 +4255,10 @@ async def session_cancel(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
-        selectable_records = await get_cancellable_session_records(interaction)
+        selectable_records = await get_selectable_server_session_records(
+            interaction,
+            require_manage=True
+        )
     except Exception as exc:
         await interaction.edit_original_response(
             content=f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
