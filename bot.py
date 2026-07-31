@@ -40,7 +40,7 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "sessions-reminders-v1"
+BOT_BUILD = "sessions-confirm-cancel-v2"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -579,8 +579,8 @@ def get_botdata_sheet(create=False):
         )
 
     botdata.update(
-        "A1:F1",
-        [BOTDATA_HEADERS]
+        values=[BOTDATA_HEADERS],
+        range_name="A1:F1"
     )
 
     return botdata
@@ -1076,8 +1076,8 @@ def sort_sheet_by_date():
     if sorted_rows:
         end_cell = rowcol_to_a1(len(sorted_rows) + 1, width)
         sheet.update(
-            f"A2:{end_cell}",
-            sorted_rows,
+            values=sorted_rows,
+            range_name=f"A2:{end_cell}",
             value_input_option="USER_ENTERED"
         )
 
@@ -1522,8 +1522,8 @@ def append_game_to_sheet(state: AddGameState):
     end_cell = rowcol_to_a1(next_row, len(headers))
 
     sheet.update(
-        f"A{next_row}:{end_cell}",
-        [row],
+        values=[row],
+        range_name=f"A{next_row}:{end_cell}",
         value_input_option="USER_ENTERED"
     )
 
@@ -2624,8 +2624,8 @@ def get_sessions_sheet(create=False):
             cols=len(SESSION_HEADERS)
         )
         worksheet.update(
-            f"A1:{rowcol_to_a1(1, len(SESSION_HEADERS))}",
-            [SESSION_HEADERS]
+            values=[SESSION_HEADERS],
+            range_name=f"A1:{rowcol_to_a1(1, len(SESSION_HEADERS))}"
         )
         return worksheet
 
@@ -2633,8 +2633,8 @@ def get_sessions_sheet(create=False):
 
     if not first_row:
         worksheet.update(
-            f"A1:{rowcol_to_a1(1, len(SESSION_HEADERS))}",
-            [SESSION_HEADERS]
+            values=[SESSION_HEADERS],
+            range_name=f"A1:{rowcol_to_a1(1, len(SESSION_HEADERS))}"
         )
     elif first_row[:len(SESSION_HEADERS)] != SESSION_HEADERS:
         raise RuntimeError(
@@ -2919,6 +2919,121 @@ async def send_session_channel_message(channel, record, heading: str):
     )
 
 
+def build_session_record_from_draft(
+    draft: SessionDraft,
+    participant_ids: list[int],
+    session_id: str = ""
+):
+    sent_days = initial_sent_reminders(
+        draft.start_utc,
+        draft.reminder_days
+    )
+
+    return {
+        "SessionID": session_id,
+        "GuildID": draft.guild_id,
+        "ChannelID": draft.channel_id,
+        "CreatorID": draft.owner_id,
+        "Title": draft.title,
+        "StartUTC": draft.start_utc.isoformat(),
+        "Location": draft.location,
+        "ParticipantIDs": serialize_number_list(participant_ids),
+        "ReminderDays": serialize_number_list(draft.reminder_days),
+        "SentReminderDays": serialize_number_list(sent_days),
+        "Status": "active",
+        "CreatedAt": datetime.now(timezone.utc).isoformat(),
+        "EventID": ""
+    }
+
+
+def format_session_summary(record, heading="Termin prüfen") -> str:
+    reminder_days = parse_number_list(record.get("ReminderDays", ""))
+    reminder_text = (
+        ", ".join(str(day) for day in reminder_days) + " Tage vorher"
+        if reminder_days
+        else "keine"
+    )
+
+    return (
+        f"**{heading}**\n"
+        f"**Name:** {record.get('Title', 'Mecatol-West-Runde')}\n"
+        f"{format_session_message(record, 'Zusammenfassung')}\n"
+        f"🔔 Erinnerungen: **{reminder_text}**"
+    )
+
+
+async def finalize_session_creation(
+    interaction: discord.Interaction,
+    draft: SessionDraft,
+    participant_ids: list[int]
+):
+    session_id = uuid.uuid4().hex[:8]
+    record = build_session_record_from_draft(
+        draft,
+        participant_ids,
+        session_id=session_id
+    )
+
+    try:
+        row_number = append_session_record(record)
+    except Exception as exc:
+        await interaction.edit_original_response(
+            content=(
+                "Der Termin konnte nicht im Google Sheet gespeichert werden:\n"
+                f"```text\n{exc}\n```"
+            ),
+            view=None
+        )
+        return
+
+    native_event_warning = ""
+
+    try:
+        native_event = await create_native_scheduled_event(
+            interaction.guild,
+            interaction.channel,
+            record
+        )
+        record["EventID"] = native_event.id
+        update_session_record(row_number, {"EventID": native_event.id})
+    except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
+        native_event_warning = (
+            "\nHinweis: Die Bot-Erinnerung ist aktiv, aber das native Discord-Event "
+            f"konnte nicht erstellt werden (`{type(exc).__name__}`). "
+            "Prüfe für den Bot die Berechtigung **Events verwalten**."
+        )
+
+    try:
+        await send_session_channel_message(
+            interaction.channel,
+            record,
+            "Termin angelegt!"
+        )
+    except discord.HTTPException as exc:
+        await interaction.edit_original_response(
+            content=(
+                "Der Termin wurde gespeichert, aber die öffentliche Bestätigung "
+                f"konnte nicht gesendet werden: `{exc}`"
+            ),
+            view=None
+        )
+        return
+
+    reminder_text = (
+        ", ".join(str(day) for day in draft.reminder_days)
+        if draft.reminder_days
+        else "keine"
+    )
+    await interaction.edit_original_response(
+        content=(
+            f"Session `{session_id}` wurde angelegt. "
+            f"Erinnerungen: **{reminder_text} Tage vorher**."
+            f"{native_event_warning}"
+        ),
+        view=None
+    )
+
+
 class SessionCreateModal(discord.ui.Modal, title="Neue Session anlegen"):
     session_title = discord.ui.TextInput(
         label="Name des Termins",
@@ -3012,78 +3127,21 @@ class SessionParticipantSelect(discord.ui.UserSelect):
             )
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        session_id = uuid.uuid4().hex[:8]
         participant_ids = [user.id for user in participants]
-        sent_days = initial_sent_reminders(
-            self.draft.start_utc,
-            self.draft.reminder_days
+        record = build_session_record_from_draft(
+            self.draft,
+            participant_ids
         )
-        record = {
-            "SessionID": session_id,
-            "GuildID": self.draft.guild_id,
-            "ChannelID": self.draft.channel_id,
-            "CreatorID": self.draft.owner_id,
-            "Title": self.draft.title,
-            "StartUTC": self.draft.start_utc.isoformat(),
-            "Location": self.draft.location,
-            "ParticipantIDs": serialize_number_list(participant_ids),
-            "ReminderDays": serialize_number_list(self.draft.reminder_days),
-            "SentReminderDays": serialize_number_list(sent_days),
-            "Status": "active",
-            "CreatedAt": datetime.now(timezone.utc).isoformat(),
-            "EventID": ""
-        }
 
-        try:
-            row_number = append_session_record(record)
-        except Exception as exc:
-            await interaction.followup.send(
-                f"Der Termin konnte nicht im Google Sheet gespeichert werden:\n```text\n{exc}\n```",
-                ephemeral=True
-            )
-            return
-
-        native_event_warning = ""
-
-        try:
-            native_event = await create_native_scheduled_event(
-                interaction.guild,
-                interaction.channel,
-                record
-            )
-            record["EventID"] = native_event.id
-            update_session_record(row_number, {"EventID": native_event.id})
-        except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
-            native_event_warning = (
-                "\nHinweis: Die Bot-Erinnerung ist aktiv, aber das native Discord-Event "
-                f"konnte nicht erstellt werden (`{type(exc).__name__}`). "
-                "Prüfe für den Bot die Berechtigung **Events verwalten**."
-            )
-
-        try:
-            await send_session_channel_message(
-                interaction.channel,
+        await interaction.response.edit_message(
+            content=format_session_summary(
                 record,
-                "Termin angelegt!"
+                heading="Bitte prüfe den Termin vor dem Anlegen"
+            ),
+            view=SessionCreateConfirmView(
+                self.draft,
+                participant_ids
             )
-        except discord.HTTPException as exc:
-            await interaction.followup.send(
-                f"Der Termin wurde gespeichert, aber die Bestätigung konnte nicht gesendet werden: `{exc}`",
-                ephemeral=True
-            )
-            return
-
-        reminder_text = (
-            ", ".join(str(day) for day in self.draft.reminder_days)
-            if self.draft.reminder_days
-            else "keine"
-        )
-        await interaction.followup.send(
-            f"Session `{session_id}` wurde angelegt. Erinnerungen: **{reminder_text} Tage vorher**."
-            f"{native_event_warning}",
-            ephemeral=True
         )
 
 
@@ -3101,6 +3159,54 @@ class SessionParticipantView(discord.ui.View):
             )
             return False
         return True
+
+
+class SessionCreateConfirmView(discord.ui.View):
+    def __init__(self, draft: SessionDraft, participant_ids: list[int]):
+        super().__init__(timeout=300)
+        self.draft = draft
+        self.participant_ids = participant_ids
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.draft.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Vorgang gestartet hat, kann diesen Termin bestätigen.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Termin anlegen",
+        style=discord.ButtonStyle.success,
+        emoji="✅"
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.defer()
+        await finalize_session_creation(
+            interaction,
+            self.draft,
+            self.participant_ids
+        )
+
+    @discord.ui.button(
+        label="Abbrechen",
+        style=discord.ButtonStyle.danger,
+        emoji="✖️"
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Vorgang abgebrochen. Es wurde kein Termin angelegt.",
+            view=None
+        )
 
 
 class SessionEditModal(discord.ui.Modal):
@@ -3230,6 +3336,202 @@ class SessionEditModal(discord.ui.Modal):
         await interaction.followup.send(
             f"Session `{self.record['SessionID']}` wurde aktualisiert.{native_event_warning}",
             ephemeral=True
+        )
+
+
+async def perform_session_cancellation(
+    interaction: discord.Interaction,
+    record
+):
+    try:
+        update_session_record(record["_row"], {"Status": "cancelled"})
+    except Exception as exc:
+        await interaction.edit_original_response(
+            content=(
+                "Die Session konnte nicht abgesagt werden:\n"
+                f"```text\n{exc}\n```"
+            ),
+            view=None
+        )
+        return
+
+    warning = ""
+    native_event = await get_native_scheduled_event(
+        interaction.guild,
+        record.get("EventID")
+    )
+
+    if native_event is not None:
+        try:
+            await native_event.cancel(reason="Session über MW_bot abgesagt")
+        except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
+            warning = f" Das native Discord-Event konnte nicht abgesagt werden (`{type(exc).__name__}`)."
+
+    try:
+        participant_ids = parse_number_list(record.get("ParticipantIDs", ""))
+        mentions = " ".join(f"<@{user_id}>" for user_id in participant_ids)
+        await interaction.channel.send(
+            f"❌ **Termin abgesagt!**\n{mentions}\n"
+            f"Der Termin **{record.get('Title', 'Mecatol-West-Runde')}** findet nicht statt.",
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                roles=False,
+                users=True,
+                replied_user=False
+            )
+        )
+    except discord.HTTPException:
+        warning += " Die öffentliche Absage konnte nicht gesendet werden."
+
+    await interaction.edit_original_response(
+        content=(
+            f"Session `{record['SessionID']}` wurde abgesagt. "
+            "Alle noch ausstehenden Erinnerungen wurden deaktiviert."
+            f"{warning}"
+        ),
+        view=None
+    )
+
+
+class SessionCancelSelect(discord.ui.Select):
+    def __init__(self, owner_id: int, records):
+        self.owner_id = owner_id
+        self.records = {
+            str(record.get("SessionID")): record
+            for record in records
+        }
+        options = []
+
+        for record in records[:25]:
+            start_local = session_datetime_from_record(record).astimezone(SESSION_TIMEZONE)
+            title = str(record.get("Title", "Mecatol-West-Runde"))
+            location = str(record.get("Location", "-"))
+            options.append(
+                discord.SelectOption(
+                    label=title[:100],
+                    description=(
+                        f"{start_local.strftime('%d.%m.%Y · %H:%M')} Uhr · {location}"
+                    )[:100],
+                    value=str(record.get("SessionID"))
+                )
+            )
+
+        super().__init__(
+            placeholder="Termin zum Absagen auswählen",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Befehl gestartet hat, kann einen Termin auswählen.",
+                ephemeral=True
+            )
+            return
+
+        record = self.records.get(self.values[0])
+
+        if record is None:
+            await interaction.response.edit_message(
+                content="Der ausgewählte Termin wurde nicht mehr gefunden.",
+                view=None
+            )
+            return
+
+        await interaction.response.edit_message(
+            content=(
+                f"{format_session_summary(record, heading='Diesen Termin wirklich absagen?')}\n\n"
+                "Beim Absagen werden alle noch ausstehenden Erinnerungen deaktiviert."
+            ),
+            view=SessionCancelConfirmView(
+                owner_id=self.owner_id,
+                session_id=str(record.get("SessionID"))
+            )
+        )
+
+
+class SessionCancelSelectView(discord.ui.View):
+    def __init__(self, owner_id: int, records):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.add_item(SessionCancelSelect(owner_id, records))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Befehl gestartet hat, kann diese Auswahl verwenden.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+
+class SessionCancelConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int, session_id: str):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.session_id = session_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Befehl gestartet hat, kann diesen Termin absagen.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Termin absagen",
+        style=discord.ButtonStyle.danger,
+        emoji="🗑️"
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        try:
+            record = find_session_record(interaction, self.session_id)
+        except Exception as exc:
+            await interaction.response.edit_message(
+                content=f"Die Session konnte nicht geladen werden:\n```text\n{exc}\n```",
+                view=None
+            )
+            return
+
+        if record is None:
+            await interaction.response.edit_message(
+                content="Dieser Termin ist nicht mehr aktiv oder wurde bereits abgesagt.",
+                view=None
+            )
+            return
+
+        if not can_manage_session(interaction, record):
+            await interaction.response.send_message(
+                "Du darfst diese Session nicht absagen.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        await perform_session_cancellation(interaction, record)
+
+    @discord.ui.button(
+        label="Zurück / nicht absagen",
+        style=discord.ButtonStyle.secondary,
+        emoji="↩️"
+    )
+    async def abort(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Abgebrochen. Der Termin bleibt bestehen und Erinnerungen bleiben aktiv.",
+            view=None
         )
 
 
@@ -3622,78 +3924,46 @@ async def session_edit(
 
 @session.command(
     name="cancel",
-    description="Sagt einen Termin ab und stoppt seine Erinnerungen"
+    description="Wählt einen Termin aus, sagt ihn ab und stoppt seine Erinnerungen"
 )
-@app_commands.describe(session_id="Optionale Session-ID, falls mehrere Termine existieren")
 @app_commands.guild_only()
-async def session_cancel(
-    interaction: discord.Interaction,
-    session_id: str = ""
-):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
+async def session_cancel(interaction: discord.Interaction):
     try:
-        record = find_session_record(interaction, session_id)
+        records = get_session_records(
+            guild_id=interaction.guild_id,
+            active_only=True
+        )
     except Exception as exc:
-        await interaction.followup.send(
+        await interaction.response.send_message(
             f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
             ephemeral=True
         )
         return
 
-    if record is None:
-        await interaction.followup.send(
-            "In diesem Kanal wurde keine aktive Session gefunden.",
+    manageable_records = [
+        record for record in records
+        if can_manage_session(interaction, record)
+    ]
+    channel_records = [
+        record for record in manageable_records
+        if str(record.get("ChannelID")) == str(interaction.channel_id)
+    ]
+    selectable_records = channel_records or manageable_records
+    selectable_records.sort(key=session_datetime_from_record)
+
+    if not selectable_records:
+        await interaction.response.send_message(
+            "Es wurde kein aktiver Termin gefunden, den du absagen darfst.",
             ephemeral=True
         )
         return
 
-    if not can_manage_session(interaction, record):
-        await interaction.followup.send(
-            "Nur der Ersteller oder ein Mitglied mit **Events verwalten** darf diese Session absagen.",
-            ephemeral=True
-        )
-        return
-
-    try:
-        update_session_record(record["_row"], {"Status": "cancelled"})
-    except Exception as exc:
-        await interaction.followup.send(
-            f"Die Session konnte nicht abgesagt werden:\n```text\n{exc}\n```",
-            ephemeral=True
-        )
-        return
-
-    warning = ""
-    native_event = await get_native_scheduled_event(
-        interaction.guild,
-        record.get("EventID")
-    )
-
-    if native_event is not None:
-        try:
-            await native_event.cancel(reason="Session über MW_bot abgesagt")
-        except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
-            warning = f" Das native Discord-Event konnte nicht abgesagt werden (`{type(exc).__name__}`)."
-
-    try:
-        participant_ids = parse_number_list(record.get("ParticipantIDs", ""))
-        mentions = " ".join(f"<@{user_id}>" for user_id in participant_ids)
-        await interaction.channel.send(
-            f"❌ **Termin abgesagt!**\n{mentions}\n"
-            f"Der Termin **{record.get('Title', 'Mecatol-West-Runde')}** findet nicht statt.",
-            allowed_mentions=discord.AllowedMentions(
-                everyone=False,
-                roles=False,
-                users=True,
-                replied_user=False
-            )
-        )
-    except discord.HTTPException:
-        warning += " Die öffentliche Absage konnte nicht gesendet werden."
-
-    await interaction.followup.send(
-        f"Session `{record['SessionID']}` wurde abgesagt.{warning}",
+    await interaction.response.send_message(
+        "Wähle den Termin aus, den du absagen möchtest:",
+        view=SessionCancelSelectView(
+            owner_id=interaction.user.id,
+            records=selectable_records[:25]
+        ),
         ephemeral=True
     )
 
