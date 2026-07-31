@@ -2877,11 +2877,13 @@ def build_session_select_options(records):
         start_local = session_datetime_from_record(record).astimezone(SESSION_TIMEZONE)
         title = str(record.get("Title", "Mecatol-West-Runde"))
         location = str(record.get("Location", "-"))
+        short_id = str(record.get("SessionID", ""))[-6:]
         options.append(
             discord.SelectOption(
                 label=title[:100],
                 description=(
-                    f"{start_local.strftime('%d.%m.%Y · %H:%M')} Uhr · {location}"
+                    f"{start_local.strftime('%d.%m.%Y · %H:%M')} Uhr · "
+                    f"{location} · ID {short_id}"
                 )[:100],
                 value=str(record.get("SessionID"))
             )
