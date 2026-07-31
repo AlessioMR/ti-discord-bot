@@ -40,7 +40,7 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "sessions-unified-picker-v3"
+BOT_BUILD = "sessions-interaction-timeout-v4"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -3597,6 +3597,7 @@ class SessionCancelConfirmView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button
     ):
+        await interaction.response.defer()
         record = self.record
 
         if not record.get("_native_only"):
@@ -3614,27 +3615,26 @@ class SessionCancelConfirmView(discord.ui.View):
                     None
                 )
             except Exception as exc:
-                await interaction.response.edit_message(
+                await interaction.edit_original_response(
                     content=f"Die Session konnte nicht geladen werden:\n```text\n{exc}\n```",
                     view=None
                 )
                 return
 
             if record is None:
-                await interaction.response.edit_message(
+                await interaction.edit_original_response(
                     content="Dieser Termin wurde im Sessions-Sheet nicht mehr gefunden.",
                     view=None
                 )
                 return
 
         if not can_manage_session(interaction, record):
-            await interaction.response.send_message(
-                "Du darfst diese Session nicht absagen.",
-                ephemeral=True
+            await interaction.edit_original_response(
+                content="Du darfst diese Session nicht absagen.",
+                view=None
             )
             return
 
-        await interaction.response.defer()
         await perform_session_cancellation(interaction, record)
 
     @discord.ui.button(
@@ -3758,15 +3758,17 @@ async def open_session_action_picker(
     action: str,
     require_manage: bool
 ):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     try:
         records = get_session_records(
             guild_id=interaction.guild_id,
             active_only=True
         )
     except Exception as exc:
-        await interaction.response.send_message(
-            f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
-            ephemeral=True
+        await interaction.edit_original_response(
+            content=f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
+            view=None
         )
         return
 
@@ -3779,9 +3781,9 @@ async def open_session_action_picker(
     records = prefer_current_channel_sessions(interaction, records)
 
     if not records:
-        await interaction.response.send_message(
-            "Es wurde kein passender aktiver Termin gefunden.",
-            ephemeral=True
+        await interaction.edit_original_response(
+            content="Es wurde kein passender aktiver Termin gefunden.",
+            view=None
         )
         return
 
@@ -3790,14 +3792,13 @@ async def open_session_action_picker(
         "edit": "Wähle den Termin aus, den du bearbeiten möchtest:",
         "remind": "Wähle den Termin aus, für den du eine Erinnerung senden möchtest:"
     }[action]
-    await interaction.response.send_message(
-        prompt,
+    await interaction.edit_original_response(
+        content=prompt,
         view=SessionActionSelectView(
             owner_id=interaction.user.id,
             records=records,
             action=action
-        ),
-        ephemeral=True
+        )
     )
 
 
@@ -4135,29 +4136,33 @@ async def session_edit(interaction: discord.Interaction):
 )
 @app_commands.guild_only()
 async def session_cancel(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     try:
         selectable_records = await get_cancellable_session_records(interaction)
     except Exception as exc:
-        await interaction.response.send_message(
-            f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
-            ephemeral=True
+        await interaction.edit_original_response(
+            content=f"Die Sessions konnten nicht geladen werden:\n```text\n{exc}\n```",
+            view=None
         )
         return
 
     if not selectable_records:
-        await interaction.response.send_message(
-            "Es wurde weder eine aktive Bot-Session noch ein absagbares Discord-Event gefunden.",
-            ephemeral=True
+        await interaction.edit_original_response(
+            content=(
+                "Es wurde weder eine aktive Bot-Session noch ein absagbares "
+                "Discord-Event gefunden."
+            ),
+            view=None
         )
         return
 
-    await interaction.response.send_message(
-        "Wähle den Termin aus, den du absagen möchtest:",
+    await interaction.edit_original_response(
+        content="Wähle den Termin aus, den du absagen möchtest:",
         view=SessionCancelSelectView(
             owner_id=interaction.user.id,
             records=selectable_records[:25]
-        ),
-        ephemeral=True
+        )
     )
 
 
