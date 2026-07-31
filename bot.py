@@ -40,7 +40,7 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "sessions-native-edit-v5"
+BOT_BUILD = "sessions-edit-reminder-overview-v6"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -2980,19 +2980,44 @@ def build_session_record_from_draft(
 
 
 def format_session_summary(record, heading="Termin prüfen") -> str:
-    reminder_days = parse_number_list(record.get("ReminderDays", ""))
-    reminder_text = (
-        ", ".join(str(day) for day in reminder_days) + " Tage vorher"
-        if reminder_days
-        else "keine"
-    )
-
     return (
         f"**{heading}**\n"
         f"**Name:** {record.get('Title', 'Mecatol-West-Runde')}\n"
         f"{format_session_message(record, 'Zusammenfassung')}\n"
-        f"🔔 Erinnerungen: **{reminder_text}**"
+        f"{format_session_reminder_details(record)}"
     )
+
+
+def format_session_reminder_details(record) -> str:
+    if record.get("_native_only"):
+        return (
+            "🔕 **Bot-Erinnerungen:** bisher keine Daten vorhanden\n"
+            "Dieses ältere Discord-Event ist noch nicht mit dem Sessions-Sheet verknüpft. "
+            "Beim Bearbeiten kannst du jetzt Erinnerungen neu einrichten."
+        )
+
+    reminder_days = sorted(
+        set(parse_number_list(record.get("ReminderDays", ""))),
+        reverse=True
+    )
+
+    if not reminder_days:
+        return "🔕 **Bot-Erinnerungen:** keine eingerichtet"
+
+    sent_days = set(parse_number_list(record.get("SentReminderDays", "")))
+    start_utc = session_datetime_from_record(record)
+    lines = ["🔔 **Bot-Erinnerungen:**"]
+
+    for day in reminder_days:
+        reminder_local = (start_utc - timedelta(days=day)).astimezone(SESSION_TIMEZONE)
+        day_text = "1 Tag vorher" if day == 1 else f"{day} Tage vorher"
+        state = "nicht mehr ausstehend" if day in sent_days else "ausstehend"
+        lines.append(
+            f"• **{day_text}:** {reminder_local.strftime('%d.%m.%Y um %H:%M Uhr')} "
+            f"({state})"
+        )
+
+    return "\n".join(lines)
 
 
 async def finalize_session_creation(
@@ -3273,8 +3298,9 @@ class SessionEditModal(discord.ui.Modal):
             max_length=100
         )
         self.reminders = discord.ui.TextInput(
-            label="Erinnerungen (Tage vorher)",
+            label="Erinnerungen: Tage vorher oder keine",
             default=str(record.get("ReminderDays", "")) or "keine",
+            placeholder="z.B. 3, 1 oder keine",
             required=False,
             max_length=50
         )
@@ -3324,7 +3350,8 @@ class SessionEditModal(discord.ui.Modal):
             "Location": str(self.location.value).strip(),
             "ReminderDays": serialize_number_list(reminder_days),
             "SentReminderDays": serialize_number_list(sent_days),
-            "Status": "active"
+            "Status": "active",
+            "EventID": self.record.get("EventID", "")
         }
 
         try:
@@ -3368,7 +3395,9 @@ class SessionEditModal(discord.ui.Modal):
             native_event_warning += " Die öffentliche Änderungsnachricht konnte nicht gesendet werden."
 
         await interaction.followup.send(
-            f"Session `{self.record['SessionID']}` wurde aktualisiert.{native_event_warning}",
+            f"Session `{self.record['SessionID']}` wurde aktualisiert.\n"
+            f"{format_session_reminder_details(self.record)}"
+            f"{native_event_warning}",
             ephemeral=True
         )
 
@@ -3403,11 +3432,19 @@ class NativeEventEditModal(discord.ui.Modal):
             required=True,
             max_length=100
         )
+        self.reminders = discord.ui.TextInput(
+            label="Erinnerungen: Tage vorher oder keine",
+            default="keine",
+            placeholder="z.B. 3, 1 oder keine",
+            required=False,
+            max_length=50
+        )
 
         self.add_item(self.session_title)
         self.add_item(self.date_value)
         self.add_item(self.time_value)
         self.add_item(self.location)
+        self.add_item(self.reminders)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -3415,6 +3452,7 @@ class NativeEventEditModal(discord.ui.Modal):
                 self.date_value.value,
                 self.time_value.value
             )
+            reminder_days = parse_reminder_days(self.reminders.value)
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
@@ -3453,20 +3491,65 @@ class NativeEventEditModal(discord.ui.Modal):
         self.record.update({
             "Title": title,
             "StartUTC": start_utc.isoformat(),
-            "Location": location
+            "Location": location,
+            "ReminderDays": serialize_number_list(reminder_days),
+            "SentReminderDays": serialize_number_list(
+                initial_sent_reminders(start_utc, reminder_days)
+            )
         })
+
+        linked_record = {
+            "SessionID": uuid.uuid4().hex[:8],
+            "GuildID": interaction.guild_id,
+            "ChannelID": self.record.get("ChannelID") or interaction.channel_id,
+            "CreatorID": interaction.user.id,
+            "Title": title,
+            "StartUTC": start_utc.isoformat(),
+            "Location": location,
+            "ParticipantIDs": self.record.get("ParticipantIDs", ""),
+            "ReminderDays": self.record["ReminderDays"],
+            "SentReminderDays": self.record["SentReminderDays"],
+            "Status": "active",
+            "CreatedAt": datetime.now(timezone.utc).isoformat(),
+            "EventID": self.record.get("EventID", "")
+        }
+
+        try:
+            linked_record["_row"] = append_session_record(linked_record)
+        except Exception as exc:
+            await interaction.followup.send(
+                "Das Discord-Event wurde aktualisiert, aber Erinnerungen und Verknüpfung "
+                f"konnten nicht im Sessions-Sheet gespeichert werden:\n```text\n{exc}\n```",
+                ephemeral=True
+            )
+            return
+
+        self.record = linked_record
 
         try:
             await interaction.channel.send(
                 format_session_message(self.record, "Termin aktualisiert!"),
-                allowed_mentions=discord.AllowedMentions.none()
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    roles=False,
+                    users=True,
+                    replied_user=False
+                )
             )
         except discord.HTTPException:
             pass
 
+        participant_warning = ""
+        if reminder_days and not parse_number_list(self.record.get("ParticipantIDs", "")):
+            participant_warning = (
+                "\n⚠️ Für das ältere Event konnten keine Teilnehmer übernommen werden; "
+                "die Erinnerung enthält deshalb derzeit keine Spieler-Pings."
+            )
+
         await interaction.followup.send(
-            "Das Discord-Event wurde aktualisiert. Für dieses ältere, nicht mit dem "
-            "Sessions-Sheet verknüpfte Event können keine Bot-Erinnerungen geändert werden.",
+            "Das Discord-Event wurde aktualisiert und mit dem Sessions-Sheet verknüpft.\n"
+            f"{format_session_reminder_details(self.record)}"
+            f"{participant_warning}",
             ephemeral=True
         )
 
@@ -3474,16 +3557,22 @@ class NativeEventEditModal(discord.ui.Modal):
 def scheduled_event_to_session_record(event):
     location = str(getattr(event, "location", "") or "Discord-Event")
     creator_id = getattr(event, "creator_id", None) or ""
+    description = str(getattr(event, "description", "") or "")
+    participant_ids = [
+        int(user_id)
+        for user_id in re.findall(r"<@!?(\d+)>", description)
+    ]
+    channel_match = re.search(r"<#(\d+)>", description)
 
     return {
         "SessionID": f"discord-{event.id}",
         "GuildID": str(event.guild_id),
-        "ChannelID": "",
+        "ChannelID": channel_match.group(1) if channel_match else "",
         "CreatorID": str(creator_id),
         "Title": str(event.name),
         "StartUTC": event.start_time.astimezone(timezone.utc).isoformat(),
         "Location": location,
-        "ParticipantIDs": "",
+        "ParticipantIDs": serialize_number_list(participant_ids),
         "ReminderDays": "",
         "SentReminderDays": "",
         "Status": "native_only",
@@ -3491,6 +3580,29 @@ def scheduled_event_to_session_record(event):
         "EventID": str(event.id),
         "_native_only": True
     }
+
+
+def session_record_matches_native_event(record, event) -> bool:
+    if str(record.get("Status", "")).lower() != "active":
+        return False
+    if str(record.get("EventID", "")).strip():
+        return False
+
+    try:
+        record_start = session_datetime_from_record(record)
+        event_start = event.start_time.astimezone(timezone.utc)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+    same_start = abs((record_start - event_start).total_seconds()) < 60
+    same_title = (
+        str(record.get("Title", "")).strip().casefold()
+        == str(event.name).strip().casefold()
+    )
+    record_location = str(record.get("Location", "")).strip().casefold()
+    event_location = str(getattr(event, "location", "") or "").strip().casefold()
+    same_location = not record_location or not event_location or record_location == event_location
+    return same_start and same_title and same_location
 
 
 async def get_selectable_server_session_records(
@@ -3519,6 +3631,8 @@ async def get_selectable_server_session_records(
     except (discord.Forbidden, discord.HTTPException):
         native_events = []
 
+    matched_unlinked_rows = set()
+
     for event in native_events:
         if event.status not in {
             discord.EventStatus.scheduled,
@@ -3529,7 +3643,21 @@ async def get_selectable_server_session_records(
         record = records_by_event_id.get(str(event.id))
 
         if record is None:
-            record = scheduled_event_to_session_record(event)
+            record = next(
+                (
+                    candidate for candidate in sheet_records
+                    if candidate.get("_row") not in matched_unlinked_rows
+                    and session_record_matches_native_event(candidate, event)
+                ),
+                None
+            )
+
+            if record is not None:
+                matched_unlinked_rows.add(record.get("_row"))
+                record["EventID"] = str(event.id)
+                record["_pending_event_link"] = True
+            else:
+                record = scheduled_event_to_session_record(event)
 
         selectable_by_key[f"event:{event.id}"] = record
 
@@ -3759,6 +3887,62 @@ class SessionCancelConfirmView(discord.ui.View):
         )
 
 
+class SessionEditReviewView(discord.ui.View):
+    def __init__(self, owner_id: int, record):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.record = record
+
+        if record.get("_native_only"):
+            self.edit.label = "Discord-Event bearbeiten"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Befehl gestartet hat, kann diesen Termin bearbeiten.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Termin & Erinnerungen bearbeiten",
+        style=discord.ButtonStyle.primary,
+        emoji="✏️"
+    )
+    async def edit(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not can_manage_session(interaction, self.record):
+            await interaction.response.send_message(
+                "Du darfst diesen Termin nicht verwalten.",
+                ephemeral=True
+            )
+            return
+
+        if self.record.get("_native_only"):
+            await interaction.response.send_modal(NativeEventEditModal(self.record))
+        else:
+            await interaction.response.send_modal(SessionEditModal(self.record))
+
+    @discord.ui.button(
+        label="Abbrechen",
+        style=discord.ButtonStyle.secondary,
+        emoji="✖️"
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Bearbeitung abgebrochen. Es wurde nichts geändert.",
+            view=None
+        )
+
+
 class SessionActionSelect(discord.ui.Select):
     ACTION_PLACEHOLDERS = {
         "show": "Termin zum Anzeigen auswählen",
@@ -3816,10 +4000,17 @@ class SessionActionSelect(discord.ui.Select):
             return
 
         if self.action == "edit":
-            if record.get("_native_only"):
-                await interaction.response.send_modal(NativeEventEditModal(record))
-            else:
-                await interaction.response.send_modal(SessionEditModal(record))
+            await interaction.response.edit_message(
+                content=format_session_summary(
+                    record,
+                    heading="Termin und Erinnerungen bearbeiten"
+                ),
+                view=SessionEditReviewView(
+                    owner_id=self.owner_id,
+                    record=record
+                ),
+                allowed_mentions=discord.AllowedMentions.none()
+            )
             return
 
         if self.action == "remind":
