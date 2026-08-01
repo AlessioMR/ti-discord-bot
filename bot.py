@@ -40,7 +40,7 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "sessions-participants-channel-edit-v8"
+BOT_BUILD = "sessions-one-row-per-event-v9"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -2826,6 +2826,93 @@ def update_session_record(row_number: int, updates: dict):
         worksheet.update_cells(cells, value_input_option="RAW")
 
 
+def delete_session_record(row_number: int):
+    worksheet = get_sessions_sheet(create=False)
+
+    if worksheet is not None:
+        worksheet.delete_rows(int(row_number))
+
+
+def delete_session_records(row_numbers):
+    for row_number in sorted(
+        {int(row) for row in row_numbers if row},
+        reverse=True
+    ):
+        delete_session_record(row_number)
+
+
+def delete_session_records_for_event(record) -> int:
+    event_id = str(record.get("EventID", "")).strip()
+    matching_rows = []
+
+    if event_id:
+        matching_rows = [
+            existing["_row"]
+            for existing in get_session_records(active_only=False)
+            if str(existing.get("EventID", "")).strip() == event_id
+            and existing.get("_row")
+        ]
+
+    if not matching_rows and record.get("_row"):
+        matching_rows = [record["_row"]]
+
+    delete_session_records(matching_rows)
+    return len(matching_rows)
+
+
+def upsert_session_record(record, preferred_row=None) -> int:
+    event_id = str(record.get("EventID", "")).strip()
+
+    if not event_id:
+        raise ValueError("Eine Session kann ohne Discord-Event-ID nicht gespeichert werden.")
+
+    matching_records = [
+        existing for existing in get_session_records(active_only=False)
+        if str(existing.get("EventID", "")).strip() == event_id
+    ]
+    matching_rows = {
+        int(existing["_row"]): existing
+        for existing in matching_records
+        if existing.get("_row")
+    }
+    preferred_row = int(preferred_row) if preferred_row else None
+
+    if preferred_row in matching_rows:
+        target_row = preferred_row
+    elif matching_rows:
+        target_row = max(matching_rows)
+    elif preferred_row:
+        target_row = preferred_row
+    else:
+        return append_session_record(record)
+
+    existing_record = matching_rows.get(target_row)
+
+    if existing_record:
+        record["SessionID"] = (
+            existing_record.get("SessionID") or record.get("SessionID", "")
+        )
+        record["CreatedAt"] = (
+            existing_record.get("CreatedAt") or record.get("CreatedAt", "")
+        )
+
+    update_session_record(
+        target_row,
+        {header: record.get(header, "") for header in SESSION_HEADERS}
+    )
+
+    duplicate_rows = [
+        row_number for row_number in matching_rows
+        if row_number != target_row
+    ]
+    delete_session_records(duplicate_rows)
+
+    return target_row - sum(
+        1 for row_number in duplicate_rows
+        if row_number < target_row
+    )
+
+
 def find_session_record(interaction: discord.Interaction, session_id: str = ""):
     records = get_session_records(
         guild_id=interaction.guild_id,
@@ -3095,33 +3182,43 @@ async def finalize_session_creation(
     )
 
     try:
-        row_number = append_session_record(record)
-    except Exception as exc:
-        await interaction.edit_original_response(
-            content=(
-                "Der Termin konnte nicht im Google Sheet gespeichert werden:\n"
-                f"```text\n{exc}\n```"
-            ),
-            view=None
-        )
-        return
-
-    native_event_warning = ""
-
-    try:
         native_event = await create_native_scheduled_event(
             interaction.guild,
             interaction.channel,
             record
         )
         record["EventID"] = str(native_event.id)
-        update_session_record(row_number, {"EventID": native_event.id})
     except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
-        native_event_warning = (
-            "\nHinweis: Die Bot-Erinnerung ist aktiv, aber das native Discord-Event "
-            f"konnte nicht erstellt werden (`{type(exc).__name__}`). "
-            "Prüfe für den Bot die Berechtigung **Events verwalten**."
+        await interaction.edit_original_response(
+            content=(
+                "Der Termin wurde nicht angelegt, weil das Discord-Event nicht erstellt "
+                f"werden konnte (`{type(exc).__name__}`). Prüfe für den Bot die "
+                "Berechtigung **Events verwalten**."
+            ),
+            view=None
         )
+        return
+
+    try:
+        record["_row"] = upsert_session_record(record)
+    except Exception as exc:
+        rollback_warning = ""
+
+        try:
+            await native_event.delete(
+                reason="Session-Speicherung fehlgeschlagen; Event zurückgerollt"
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            rollback_warning = " Das bereits erstellte Discord-Event konnte nicht entfernt werden."
+
+        await interaction.edit_original_response(
+            content=(
+                "Der Termin konnte nicht im Google Sheet gespeichert werden:\n"
+                f"```text\n{exc}\n```{rollback_warning}"
+            ),
+            view=None
+        )
+        return
 
     try:
         await send_session_channel_message(
@@ -3144,7 +3241,6 @@ async def finalize_session_creation(
         content=(
             f"Session `{session_id}` wurde angelegt.\n"
             f"{format_session_reminder_details(record)}"
-            f"{native_event_warning}"
         ),
         view=None
     )
@@ -3643,8 +3739,13 @@ async def finalize_linked_session_edit(
         "EventID": record.get("EventID", "")
     }
 
+    record.update(updates)
+
     try:
-        update_session_record(record["_row"], updates)
+        record["_row"] = upsert_session_record(
+            record,
+            preferred_row=record.get("_row")
+        )
     except Exception as exc:
         await interaction.edit_original_response(
             content=f"Die Session konnte nicht gespeichert werden:\n```text\n{exc}\n```",
@@ -3652,7 +3753,6 @@ async def finalize_linked_session_edit(
         )
         return
 
-    record.update(updates)
     native_event_warning = ""
     native_event = await get_native_scheduled_event(
         interaction.guild,
@@ -3750,7 +3850,7 @@ async def finalize_native_session_edit(
         return
 
     try:
-        linked_record["_row"] = append_session_record(linked_record)
+        linked_record["_row"] = upsert_session_record(linked_record)
     except Exception as exc:
         await interaction.edit_original_response(
             content=(
@@ -4065,23 +4165,79 @@ async def get_selectable_server_session_records(
     return selectable_records[:25]
 
 
+async def build_session_cleanup_plan(guild):
+    native_events = await guild.fetch_scheduled_events(with_counts=False)
+    active_events = {
+        str(event.id): event
+        for event in native_events
+        if event.status in {
+            discord.EventStatus.scheduled,
+            discord.EventStatus.active
+        }
+    }
+    records = get_session_records(active_only=False)
+    guild_records = [
+        record for record in records
+        if str(record.get("GuildID", "")) == str(guild.id)
+        or str(record.get("EventID", "")) in active_events
+    ]
+    rows_to_delete = set()
+    orphan_rows = set()
+    duplicate_rows = set()
+    keep_by_event_id = {}
+
+    for record in guild_records:
+        event_id = str(record.get("EventID", "")).strip()
+
+        if str(record.get("GuildID", "")) == str(guild.id) and event_id not in active_events:
+            rows_to_delete.add(record["_row"])
+            orphan_rows.add(record["_row"])
+
+    for event_id, event in active_events.items():
+        matching_records = [
+            record for record in guild_records
+            if str(record.get("EventID", "")).strip() == event_id
+        ]
+
+        if not matching_records:
+            continue
+
+        keep_record = max(
+            matching_records,
+            key=lambda record: (
+                str(record.get("Status", "")).lower() == "active",
+                int(record.get("_row", 0))
+            )
+        )
+        keep_by_event_id[event_id] = (keep_record, event)
+
+        for duplicate in matching_records:
+            if duplicate["_row"] != keep_record["_row"]:
+                rows_to_delete.add(duplicate["_row"])
+                duplicate_rows.add(duplicate["_row"])
+
+    return {
+        "rows_to_delete": sorted(rows_to_delete, reverse=True),
+        "orphan_count": len(orphan_rows),
+        "duplicate_count": len(duplicate_rows),
+        "keep_by_event_id": keep_by_event_id
+    }
+
+
+def apply_session_cleanup_plan(guild, plan):
+    for record, event in plan["keep_by_event_id"].values():
+        repair_session_ids_from_native_event(guild.id, record, event)
+
+        if str(record.get("Status", "")).lower() != "active":
+            update_session_record(record["_row"], {"Status": "active"})
+
+    delete_session_records(plan["rows_to_delete"])
+
+
 async def perform_session_cancellation(
     interaction: discord.Interaction,
     record
 ):
-    if record.get("_row"):
-        try:
-            update_session_record(record["_row"], {"Status": "cancelled"})
-        except Exception as exc:
-            await interaction.edit_original_response(
-                content=(
-                    "Die Session konnte nicht abgesagt werden:\n"
-                    f"```text\n{exc}\n```"
-                ),
-                view=None
-            )
-            return
-
     warning = ""
     native_event = await get_native_scheduled_event(
         interaction.guild,
@@ -4098,12 +4254,41 @@ async def perform_session_cancellation(
             try:
                 await native_event.delete(reason="Session über MW_bot entfernt")
             except (discord.Forbidden, discord.HTTPException) as exc:
-                warning = (
-                    " Das native Discord-Event konnte nicht entfernt werden "
-                    f"(`{type(exc).__name__}`)."
+                await interaction.edit_original_response(
+                    content=(
+                        "Das Discord-Event konnte nicht entfernt werden "
+                        f"(`{type(exc).__name__}`). Die Session bleibt gespeichert."
+                    ),
+                    view=None
                 )
+                return
         except (discord.Forbidden, discord.HTTPException) as exc:
-            warning = f" Das native Discord-Event konnte nicht abgesagt werden (`{type(exc).__name__}`)."
+            await interaction.edit_original_response(
+                content=(
+                    "Das Discord-Event konnte nicht abgesagt werden "
+                    f"(`{type(exc).__name__}`). Die Session bleibt gespeichert."
+                ),
+                view=None
+            )
+            return
+
+    if record.get("_row"):
+        try:
+            delete_session_records_for_event(record)
+        except Exception as exc:
+            try:
+                update_session_record(record["_row"], {"Status": "cancelled"})
+            except Exception:
+                pass
+
+            await interaction.edit_original_response(
+                content=(
+                    "Das Discord-Event wurde abgesagt, aber die Zeile konnte nicht aus "
+                    f"dem Sessions-Sheet entfernt werden:\n```text\n{exc}\n```"
+                ),
+                view=None
+            )
+            return
 
     try:
         participant_ids = parse_number_list(record.get("ParticipantIDs", ""))
@@ -4124,7 +4309,7 @@ async def perform_session_cancellation(
     await interaction.edit_original_response(
         content=(
             f"Session `{record['SessionID']}` wurde abgesagt. "
-            "Alle noch ausstehenden Erinnerungen wurden deaktiviert."
+            "Die Sheet-Zeile wurde entfernt und alle Erinnerungen wurden deaktiviert."
             f"{warning}"
         ),
         view=None
@@ -4267,6 +4452,76 @@ class SessionCancelConfirmView(discord.ui.View):
     ):
         await interaction.response.edit_message(
             content="Abgebrochen. Der Termin bleibt bestehen und Erinnerungen bleiben aktiv.",
+            view=None
+        )
+
+
+class SessionCleanupConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die die Bereinigung gestartet hat, kann sie bestätigen.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Sheet bereinigen",
+        style=discord.ButtonStyle.danger,
+        emoji="🧹"
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        permissions = getattr(interaction.user, "guild_permissions", None)
+
+        if not permissions or not permissions.manage_events:
+            await interaction.response.send_message(
+                "Du benötigst die Berechtigung **Events verwalten**.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        try:
+            plan = await build_session_cleanup_plan(interaction.guild)
+            apply_session_cleanup_plan(interaction.guild, plan)
+        except Exception as exc:
+            await interaction.edit_original_response(
+                content=f"Die Bereinigung ist fehlgeschlagen:\n```text\n{exc}\n```",
+                view=None
+            )
+            return
+
+        await interaction.edit_original_response(
+            content=(
+                f"Bereinigung abgeschlossen: **{len(plan['rows_to_delete'])}** Zeilen entfernt "
+                f"({plan['duplicate_count']} Duplikate, "
+                f"{plan['orphan_count']} nicht mehr vorhandene Termine)."
+            ),
+            view=None
+        )
+
+    @discord.ui.button(
+        label="Abbrechen",
+        style=discord.ButtonStyle.secondary,
+        emoji="✖️"
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Bereinigung abgebrochen. Es wurde nichts gelöscht.",
             view=None
         )
 
@@ -4576,9 +4831,13 @@ async def session_reminder_loop():
 
         if start_utc <= now_utc:
             try:
-                update_session_record(record["_row"], {"Status": "completed"})
+                delete_session_records_for_event(record)
             except Exception as exc:
-                print(f"Session-Reminder: Status konnte nicht aktualisiert werden: {exc}")
+                try:
+                    update_session_record(record["_row"], {"Status": "completed"})
+                except Exception:
+                    pass
+                print(f"Session-Reminder: Abgelaufene Session konnte nicht entfernt werden: {exc}")
             continue
 
         reminder_days = set(parse_number_list(record.get("ReminderDays", "")))
@@ -4917,6 +5176,50 @@ async def session_remind(interaction: discord.Interaction):
         interaction,
         action="remind",
         require_manage=True
+    )
+
+
+@session.command(
+    name="cleanup",
+    description="Entfernt Duplikate und nicht mehr vorhandene Termine aus dem Sessions-Sheet"
+)
+@app_commands.guild_only()
+async def session_cleanup(interaction: discord.Interaction):
+    permissions = getattr(interaction.user, "guild_permissions", None)
+
+    if not permissions or not permissions.manage_events:
+        await interaction.response.send_message(
+            "Du benötigst die Berechtigung **Events verwalten**.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        plan = await build_session_cleanup_plan(interaction.guild)
+    except Exception as exc:
+        await interaction.edit_original_response(
+            content=f"Die Bereinigung konnte nicht vorbereitet werden:\n```text\n{exc}\n```",
+            view=None
+        )
+        return
+
+    if not plan["rows_to_delete"]:
+        await interaction.edit_original_response(
+            content="Das Sessions-Sheet ist bereits sauber. Es wurden keine Zeilen gefunden.",
+            view=None
+        )
+        return
+
+    await interaction.edit_original_response(
+        content=(
+            f"Es würden **{len(plan['rows_to_delete'])}** Zeilen entfernt:\n"
+            f"• **{plan['duplicate_count']}** redundante Zeilen zu vorhandenen Events\n"
+            f"• **{plan['orphan_count']}** Zeilen ohne aktuell vorhandenes Discord-Event\n\n"
+            "Aktive Discord-Events und jeweils eine zugehörige Sheet-Zeile bleiben erhalten."
+        ),
+        view=SessionCleanupConfirmView(interaction.user.id)
     )
 
 
