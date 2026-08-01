@@ -40,7 +40,7 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "sessions-one-row-per-event-v9"
+BOT_BUILD = "sessions-chronological-sheet-v10"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -2833,12 +2833,41 @@ def delete_session_record(row_number: int):
         worksheet.delete_rows(int(row_number))
 
 
+def sort_sessions_sheet_by_start():
+    worksheet = get_sessions_sheet(create=False)
+
+    if worksheet is None:
+        return
+
+    values = worksheet.get_all_values()
+
+    if len(values) < 3:
+        return
+
+    headers = values[0]
+
+    if "StartUTC" not in headers:
+        return
+
+    start_column = headers.index("StartUTC") + 1
+    last_column = rowcol_to_a1(1, len(headers)).replace("1", "")
+    worksheet.sort(
+        (start_column, "asc"),
+        range=f"A2:{last_column}{len(values)}"
+    )
+
+
 def delete_session_records(row_numbers):
-    for row_number in sorted(
+    sorted_rows = sorted(
         {int(row) for row in row_numbers if row},
         reverse=True
-    ):
+    )
+
+    for row_number in sorted_rows:
         delete_session_record(row_number)
+
+    if sorted_rows:
+        sort_sessions_sheet_by_start()
 
 
 def delete_session_records_for_event(record) -> int:
@@ -2884,7 +2913,13 @@ def upsert_session_record(record, preferred_row=None) -> int:
     elif preferred_row:
         target_row = preferred_row
     else:
-        return append_session_record(record)
+        append_session_record(record)
+        sort_sessions_sheet_by_start()
+        matching_after_sort = [
+            existing for existing in get_session_records(active_only=False)
+            if str(existing.get("EventID", "")).strip() == event_id
+        ]
+        return matching_after_sort[0]["_row"]
 
     existing_record = matching_rows.get(target_row)
 
@@ -2906,11 +2941,12 @@ def upsert_session_record(record, preferred_row=None) -> int:
         if row_number != target_row
     ]
     delete_session_records(duplicate_rows)
-
-    return target_row - sum(
-        1 for row_number in duplicate_rows
-        if row_number < target_row
-    )
+    sort_sessions_sheet_by_start()
+    matching_after_sort = [
+        existing for existing in get_session_records(active_only=False)
+        if str(existing.get("EventID", "")).strip() == event_id
+    ]
+    return matching_after_sort[0]["_row"]
 
 
 def find_session_record(interaction: discord.Interaction, session_id: str = ""):
@@ -5228,6 +5264,11 @@ async def session_cleanup(interaction: discord.Interaction):
 # =========================================================
 @client.event
 async def on_ready():
+    try:
+        sort_sessions_sheet_by_start()
+    except Exception as exc:
+        print(f"Sessions-Sheet konnte beim Start nicht sortiert werden: {exc}")
+
     if not session_reminder_loop.is_running():
         session_reminder_loop.start()
 
