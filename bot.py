@@ -40,7 +40,7 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "botdata-centralized-v11"
+BOT_BUILD = "botdata-sheet-only-v12"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -82,15 +82,6 @@ BOTDATA_HEADERS = [
     "SortOrder"
 ]
 
-LEGACY_BOTDATA_HEADERS = [
-    "PlayerName",
-    "FactionName",
-    "FactionCategory",
-    "PointsValue",
-    "ExpansionValue",
-    "ModificationValue"
-]
-
 BOTDATA_TYPE_PLAYER = "player"
 BOTDATA_TYPE_FACTION = "faction"
 BOTDATA_TYPE_POINTS = "points"
@@ -112,114 +103,10 @@ FACTION_CATEGORY_LABELS = {
     FACTION_CATEGORY_DISCORDANT_STARS: "Discordant Stars"
 }
 
-LEGACY_STANDARD_FACTIONS_A_M = [
-    "Arborec",
-    "Argent",
-    "Barony",
-    "Bastion",
-    "Cabal",
-    "Creuss",
-    "Crimson",
-    "DWS",
-    "Empyrean",
-    "Hacan",
-    "Jol Nar",
-    "Keleres",
-    "L1",
-    "Mahact",
-    "Mentak",
-    "Muaat"
-]
-
-LEGACY_STANDARD_FACTIONS_N_Z = [
-    "Naalu",
-    "Naaz",
-    "Nekro",
-    "Nomad",
-    "Obsidian",
-    "Ralnel",
-    "Saar",
-    "Sardakk",
-    "Sol",
-    "Titans",
-    "Winnu",
-    "Xxcha",
-    "Yin",
-    "Yssaril"
-]
-
-LEGACY_TWILIGHTS_FALL_FACTIONS = [
-    "TF_Orange",
-    "TF_Grün",
-    "TF_Lila",
-    "TF_Gelb",
-    "TF_Rot"
-]
-
-FACTION_CANONICAL = {
-    "arborec": "Arborec",
-    "argent": "Argent",
-    "barony": "Barony",
-    "bastion": "Bastion",
-    "cabal": "Cabal",
-    "creuss": "Creuss",
-    "crimson": "Crimson",
-    "dws": "DWS",
-    "empyrean": "Empyrean",
-    "hacan": "Hacan",
-    "jol nar": "Jol Nar",
+FACTION_ALIASES = {
     "jolnar": "Jol Nar",
-    "keleres": "Keleres",
-    "l1": "L1",
     "letnev": "Barony",
-    "mahact": "Mahact",
-    "mentak": "Mentak",
-    "muaat": "Muaat",
-    "naalu": "Naalu",
-    "naaz": "Naaz",
-    "nekro": "Nekro",
-    "nomad": "Nomad",
-    "obsidian": "Obsidian",
-    "ralnel": "Ralnel",
-    "saar": "Saar",
-    "sardakk": "Sardakk",
-    "sol": "Sol",
-    "titans": "Titans",
-    "winnu": "Winnu",
-    "xxcha": "Xxcha",
-    "yin": "Yin",
-    "yssaril": "Yssaril",
-    "tf_orange": "TF_Orange",
-    "tf_grün": "TF_Grün",
-    "tf_lila": "TF_Lila",
-    "tf_gelb": "TF_Gelb",
-    "tf_rot": "TF_Rot"
 }
-
-KNOWN_FACTIONS = set(FACTION_CANONICAL.keys())
-
-LEGACY_DEFAULT_POINTS = [
-    "10",
-    "12",
-    "14"
-]
-
-LEGACY_DEFAULT_EXPANSIONS = [
-    "Basis",
-    "PoK",
-    "TE"
-]
-
-LEGACY_DEFAULT_MODIFICATIONS = [
-    "Standard",
-    "Hidden Agenda",
-    "Twilights Fall",
-    "Absols Agendas",
-    "Minor Factions",
-    "Cosmic Phenomenae",
-    "4/4/4",
-    "Total War"
-]
 
 PLAYER_COLUMN_CANDIDATES = [
     "Spieler (VP, Volk)",
@@ -331,9 +218,47 @@ def canonical_faction(faction: str) -> str:
     if not faction:
         return "Unbekannt"
 
-    key = faction.lower()
+    key = normalize_name(faction)
 
-    return FACTION_CANONICAL.get(key, faction)
+    if key in FACTION_ALIASES:
+        return FACTION_ALIASES[key]
+
+    try:
+        records = get_botdata_records(data_type=BOTDATA_TYPE_FACTION)
+    except Exception:
+        records = _botdata_cache.get("records", [])
+
+    for record in records:
+        if (
+            record.get("type") == BOTDATA_TYPE_FACTION
+            and normalize_name(record.get("value", "")) == key
+        ):
+            return record["value"]
+
+    return faction
+
+
+def is_known_faction(faction: str) -> bool:
+    faction = clean_text(faction)
+
+    if not faction:
+        return False
+
+    key = normalize_name(faction)
+
+    if key in FACTION_ALIASES:
+        return True
+
+    try:
+        records = get_botdata_records(data_type=BOTDATA_TYPE_FACTION)
+    except Exception:
+        records = _botdata_cache.get("records", [])
+
+    return any(
+        record.get("type") == BOTDATA_TYPE_FACTION
+        and normalize_name(record.get("value", "")) == key
+        for record in records
+    )
 
 
 def parse_number(value):
@@ -543,8 +468,8 @@ def parse_player_entry(entry: str):
         faction = "Unbekannt"
 
     if (
-        normalize_name(name) in KNOWN_FACTIONS
-        and normalize_name(faction) not in KNOWN_FACTIONS
+        is_known_faction(name)
+        and not is_known_faction(faction)
         and faction != "Unbekannt"
     ):
         name, faction = faction, name
@@ -612,139 +537,22 @@ def parse_botdata_sort_order(value, fallback):
     return number if number is not None else fallback
 
 
-def get_legacy_botdata_values(botdata):
-    values = botdata.get_all_values()
-
-    if not values:
-        return []
-
-    if not botdata_headers_match(values[0], LEGACY_BOTDATA_HEADERS):
-        return []
-
-    return values[1:]
-
-
-def build_botdata_migration_records(legacy_rows):
-    records = []
-    seen = set()
-    sort_orders = Counter()
-
-    def add_record(data_type, value, category=""):
-        value = clean_text(value)
-        category = clean_text(category)
-
-        if not value:
-            return
-
-        if data_type == BOTDATA_TYPE_PLAYER:
-            value = canonical_player_name(value)
-            if is_excluded_from_player_dropdown(value):
-                return
-        elif data_type == BOTDATA_TYPE_FACTION:
-            value = canonical_faction(value)
-            if value == "Unbekannt" or ") (" in value:
-                return
-
-        key = (data_type, normalize_name(value))
-
-        if key in seen:
-            return
-
-        seen.add(key)
-        sort_orders[data_type] += 10
-        records.append({
-            "Type": data_type,
-            "Value": value,
-            "Category": category,
-            "Active": "TRUE",
-            "SortOrder": str(sort_orders[data_type])
-        })
-
-    for faction in LEGACY_STANDARD_FACTIONS_A_M:
-        add_record(BOTDATA_TYPE_FACTION, faction, FACTION_CATEGORY_STANDARD_A_M)
-
-    for faction in LEGACY_STANDARD_FACTIONS_N_Z:
-        add_record(BOTDATA_TYPE_FACTION, faction, FACTION_CATEGORY_STANDARD_N_Z)
-
-    for faction in LEGACY_TWILIGHTS_FALL_FACTIONS:
-        add_record(BOTDATA_TYPE_FACTION, faction, FACTION_CATEGORY_TWILIGHTS_FALL)
-
-    for value in LEGACY_DEFAULT_POINTS:
-        add_record(BOTDATA_TYPE_POINTS, value)
-
-    for value in LEGACY_DEFAULT_EXPANSIONS:
-        add_record(BOTDATA_TYPE_EXPANSION, value)
-
-    for value in LEGACY_DEFAULT_MODIFICATIONS:
-        add_record(BOTDATA_TYPE_MODIFICATION, value)
-
-    for row in legacy_rows:
-        padded = list(row) + [""] * (len(LEGACY_BOTDATA_HEADERS) - len(row))
-        add_record(BOTDATA_TYPE_PLAYER, padded[0])
-        add_record(
-            BOTDATA_TYPE_FACTION,
-            padded[1],
-            padded[2] or FACTION_CATEGORY_DISCORDANT_STARS
-        )
-        add_record(BOTDATA_TYPE_POINTS, padded[3])
-        add_record(BOTDATA_TYPE_EXPANSION, padded[4])
-        add_record(BOTDATA_TYPE_MODIFICATION, padded[5])
-
-    for row in get_rows():
-        for winner in split_winner_names(row.get("Gewinner", "")):
-            add_record(BOTDATA_TYPE_PLAYER, winner)
-
-        for community_name in split_community_names(row.get("Community Preis", "")):
-            add_record(BOTDATA_TYPE_PLAYER, community_name)
-
-        for player in parse_game_players(get_player_column(row)):
-            add_record(BOTDATA_TYPE_PLAYER, player.get("name", ""))
-
-        add_record(BOTDATA_TYPE_POINTS, row.get("Punkte", ""))
-
-        for expansion in split_multi_value_cell(row.get("Erweiterung", "")):
-            add_record(BOTDATA_TYPE_EXPANSION, expansion)
-
-        for modification in split_multi_value_cell(row.get("Modifikation", "")):
-            add_record(BOTDATA_TYPE_MODIFICATION, modification)
-
-    return records
-
-
 def ensure_botdata_schema():
     botdata = get_botdata_sheet(create=True)
     values = botdata.get_all_values()
 
-    if values and botdata_headers_match(values[0], BOTDATA_HEADERS):
+    if not values:
+        botdata.update(
+            values=[BOTDATA_HEADERS],
+            range_name="A1:E1"
+        )
         return botdata
 
-    if values and not botdata_headers_match(values[0], LEGACY_BOTDATA_HEADERS):
+    if not botdata_headers_match(values[0], BOTDATA_HEADERS):
         raise RuntimeError(
             "BotData hat unbekannte Spalten. Erwartet werden "
             + ", ".join(BOTDATA_HEADERS)
         )
-
-    legacy_rows = values[1:] if values else []
-    records = build_botdata_migration_records(legacy_rows)
-    output = [BOTDATA_HEADERS] + [
-        [
-            record["Type"],
-            record["Value"],
-            record["Category"],
-            record["Active"],
-            record["SortOrder"]
-        ]
-        for record in records
-    ]
-
-    botdata.clear()
-    botdata.resize(rows=max(100, len(output) + 20), cols=len(BOTDATA_HEADERS))
-    botdata.update(
-        values=output,
-        range_name=f"A1:E{len(output)}"
-    )
-    invalidate_botdata_cache()
-    print(f"BotData wurde auf das neue Schema migriert: {len(records)} Einträge.")
 
     return botdata
 
@@ -971,7 +779,7 @@ def get_modification_options():
 
     standard = next(
         (value for value in filtered if normalize_name(value) == "standard"),
-        "Standard"
+        None
     )
 
     rest = [
@@ -979,7 +787,7 @@ def get_modification_options():
         if normalize_name(value) != "standard"
     ]
 
-    return [standard] + rest
+    return ([standard] if standard else []) + rest
 
 
 def clean_selected_values(values):
