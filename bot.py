@@ -40,7 +40,7 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "sessions-chronological-sheet-v10"
+BOT_BUILD = "botdata-centralized-v11"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -75,6 +75,14 @@ tree.add_command(session)
 # 🧠 CONSTANTS / HELPERS
 # =========================================================
 BOTDATA_HEADERS = [
+    "Type",
+    "Value",
+    "Category",
+    "Active",
+    "SortOrder"
+]
+
+LEGACY_BOTDATA_HEADERS = [
     "PlayerName",
     "FactionName",
     "FactionCategory",
@@ -83,12 +91,14 @@ BOTDATA_HEADERS = [
     "ModificationValue"
 ]
 
-BOTDATA_COL_PLAYER = 1
-BOTDATA_COL_FACTION = 2
-BOTDATA_COL_FACTION_CATEGORY = 3
-BOTDATA_COL_POINTS = 4
-BOTDATA_COL_EXPANSION = 5
-BOTDATA_COL_MODIFICATION = 6
+BOTDATA_TYPE_PLAYER = "player"
+BOTDATA_TYPE_FACTION = "faction"
+BOTDATA_TYPE_POINTS = "points"
+BOTDATA_TYPE_EXPANSION = "expansion"
+BOTDATA_TYPE_MODIFICATION = "modification"
+
+BOTDATA_ACTIVE_VALUES = {"1", "true", "yes", "ja", "y", "x"}
+BOTDATA_CACHE_SECONDS = 300
 
 FACTION_CATEGORY_STANDARD_A_M = "standard_a_m"
 FACTION_CATEGORY_STANDARD_N_Z = "standard_n_z"
@@ -102,7 +112,7 @@ FACTION_CATEGORY_LABELS = {
     FACTION_CATEGORY_DISCORDANT_STARS: "Discordant Stars"
 }
 
-STANDARD_FACTIONS_A_M = [
+LEGACY_STANDARD_FACTIONS_A_M = [
     "Arborec",
     "Argent",
     "Barony",
@@ -121,7 +131,7 @@ STANDARD_FACTIONS_A_M = [
     "Muaat"
 ]
 
-STANDARD_FACTIONS_N_Z = [
+LEGACY_STANDARD_FACTIONS_N_Z = [
     "Naalu",
     "Naaz",
     "Nekro",
@@ -138,15 +148,13 @@ STANDARD_FACTIONS_N_Z = [
     "Yssaril"
 ]
 
-TWILIGHTS_FALL_FACTIONS = [
+LEGACY_TWILIGHTS_FALL_FACTIONS = [
     "TF_Orange",
     "TF_Grün",
     "TF_Lila",
     "TF_Gelb",
     "TF_Rot"
 ]
-
-DISCORDANT_STARS_FACTIONS = []
 
 FACTION_CANONICAL = {
     "arborec": "Arborec",
@@ -188,28 +196,21 @@ FACTION_CANONICAL = {
     "tf_rot": "TF_Rot"
 }
 
-STANDARD_FACTIONS_ALL = (
-    STANDARD_FACTIONS_A_M
-    + STANDARD_FACTIONS_N_Z
-    + TWILIGHTS_FALL_FACTIONS
-    + DISCORDANT_STARS_FACTIONS
-)
-
 KNOWN_FACTIONS = set(FACTION_CANONICAL.keys())
 
-DEFAULT_POINTS = [
+LEGACY_DEFAULT_POINTS = [
     "10",
     "12",
     "14"
 ]
 
-DEFAULT_EXPANSIONS = [
+LEGACY_DEFAULT_EXPANSIONS = [
     "Basis",
     "PoK",
     "TE"
 ]
 
-DEFAULT_MODIFICATIONS = [
+LEGACY_DEFAULT_MODIFICATIONS = [
     "Standard",
     "Hidden Agenda",
     "Twilights Fall",
@@ -249,6 +250,11 @@ _player_name_cache = {
 _faction_name_cache = {
     "timestamp": 0,
     "names": []
+}
+
+_botdata_cache = {
+    "timestamp": 0,
+    "records": []
 }
 
 
@@ -575,62 +581,293 @@ def get_botdata_sheet(create=False):
         botdata = spreadsheet.add_worksheet(
             title=BOTDATA_SHEET_NAME,
             rows=500,
-            cols=6
+            cols=len(BOTDATA_HEADERS)
         )
 
-    botdata.update(
-        values=[BOTDATA_HEADERS],
-        range_name="A1:F1"
-    )
+        botdata.update(
+            values=[BOTDATA_HEADERS],
+            range_name="A1:E1"
+        )
 
     return botdata
 
 
-def get_botdata_column_values(column_index):
-    botdata = get_botdata_sheet(create=False)
+def botdata_headers_match(values, expected_headers):
+    normalized = [clean_text(value) for value in values[:len(expected_headers)]]
+    return normalized == expected_headers
 
-    if botdata is None:
+
+def invalidate_botdata_cache():
+    _botdata_cache["timestamp"] = 0
+    _botdata_cache["records"] = []
+
+
+def parse_botdata_active(value):
+    text = normalize_name(value)
+    return not text or text in BOTDATA_ACTIVE_VALUES
+
+
+def parse_botdata_sort_order(value, fallback):
+    number = parse_number(value)
+    return number if number is not None else fallback
+
+
+def get_legacy_botdata_values(botdata):
+    values = botdata.get_all_values()
+
+    if not values:
         return []
 
-    values = botdata.col_values(column_index)
+    if not botdata_headers_match(values[0], LEGACY_BOTDATA_HEADERS):
+        return []
 
-    return [
-        value.strip()
-        for value in values[1:]
-        if value.strip()
+    return values[1:]
+
+
+def build_botdata_migration_records(legacy_rows):
+    records = []
+    seen = set()
+    sort_orders = Counter()
+
+    def add_record(data_type, value, category=""):
+        value = clean_text(value)
+        category = clean_text(category)
+
+        if not value:
+            return
+
+        if data_type == BOTDATA_TYPE_PLAYER:
+            value = canonical_player_name(value)
+            if is_excluded_from_player_dropdown(value):
+                return
+        elif data_type == BOTDATA_TYPE_FACTION:
+            value = canonical_faction(value)
+            if value == "Unbekannt" or ") (" in value:
+                return
+
+        key = (data_type, normalize_name(value))
+
+        if key in seen:
+            return
+
+        seen.add(key)
+        sort_orders[data_type] += 10
+        records.append({
+            "Type": data_type,
+            "Value": value,
+            "Category": category,
+            "Active": "TRUE",
+            "SortOrder": str(sort_orders[data_type])
+        })
+
+    for faction in LEGACY_STANDARD_FACTIONS_A_M:
+        add_record(BOTDATA_TYPE_FACTION, faction, FACTION_CATEGORY_STANDARD_A_M)
+
+    for faction in LEGACY_STANDARD_FACTIONS_N_Z:
+        add_record(BOTDATA_TYPE_FACTION, faction, FACTION_CATEGORY_STANDARD_N_Z)
+
+    for faction in LEGACY_TWILIGHTS_FALL_FACTIONS:
+        add_record(BOTDATA_TYPE_FACTION, faction, FACTION_CATEGORY_TWILIGHTS_FALL)
+
+    for value in LEGACY_DEFAULT_POINTS:
+        add_record(BOTDATA_TYPE_POINTS, value)
+
+    for value in LEGACY_DEFAULT_EXPANSIONS:
+        add_record(BOTDATA_TYPE_EXPANSION, value)
+
+    for value in LEGACY_DEFAULT_MODIFICATIONS:
+        add_record(BOTDATA_TYPE_MODIFICATION, value)
+
+    for row in legacy_rows:
+        padded = list(row) + [""] * (len(LEGACY_BOTDATA_HEADERS) - len(row))
+        add_record(BOTDATA_TYPE_PLAYER, padded[0])
+        add_record(
+            BOTDATA_TYPE_FACTION,
+            padded[1],
+            padded[2] or FACTION_CATEGORY_DISCORDANT_STARS
+        )
+        add_record(BOTDATA_TYPE_POINTS, padded[3])
+        add_record(BOTDATA_TYPE_EXPANSION, padded[4])
+        add_record(BOTDATA_TYPE_MODIFICATION, padded[5])
+
+    for row in get_rows():
+        for winner in split_winner_names(row.get("Gewinner", "")):
+            add_record(BOTDATA_TYPE_PLAYER, winner)
+
+        for community_name in split_community_names(row.get("Community Preis", "")):
+            add_record(BOTDATA_TYPE_PLAYER, community_name)
+
+        for player in parse_game_players(get_player_column(row)):
+            add_record(BOTDATA_TYPE_PLAYER, player.get("name", ""))
+
+        add_record(BOTDATA_TYPE_POINTS, row.get("Punkte", ""))
+
+        for expansion in split_multi_value_cell(row.get("Erweiterung", "")):
+            add_record(BOTDATA_TYPE_EXPANSION, expansion)
+
+        for modification in split_multi_value_cell(row.get("Modifikation", "")):
+            add_record(BOTDATA_TYPE_MODIFICATION, modification)
+
+    return records
+
+
+def ensure_botdata_schema():
+    botdata = get_botdata_sheet(create=True)
+    values = botdata.get_all_values()
+
+    if values and botdata_headers_match(values[0], BOTDATA_HEADERS):
+        return botdata
+
+    if values and not botdata_headers_match(values[0], LEGACY_BOTDATA_HEADERS):
+        raise RuntimeError(
+            "BotData hat unbekannte Spalten. Erwartet werden "
+            + ", ".join(BOTDATA_HEADERS)
+        )
+
+    legacy_rows = values[1:] if values else []
+    records = build_botdata_migration_records(legacy_rows)
+    output = [BOTDATA_HEADERS] + [
+        [
+            record["Type"],
+            record["Value"],
+            record["Category"],
+            record["Active"],
+            record["SortOrder"]
+        ]
+        for record in records
     ]
+
+    botdata.clear()
+    botdata.resize(rows=max(100, len(output) + 20), cols=len(BOTDATA_HEADERS))
+    botdata.update(
+        values=output,
+        range_name=f"A1:E{len(output)}"
+    )
+    invalidate_botdata_cache()
+    print(f"BotData wurde auf das neue Schema migriert: {len(records)} Einträge.")
+
+    return botdata
+
+
+def get_botdata_records(data_type=None, active_only=True, force_refresh=False):
+    now = time.time()
+
+    if (
+        not force_refresh
+        and now - _botdata_cache["timestamp"] < BOTDATA_CACHE_SECONDS
+        and _botdata_cache["records"]
+    ):
+        records = _botdata_cache["records"]
+    else:
+        botdata = ensure_botdata_schema()
+        values = botdata.get_all_values()
+        records = []
+
+        for row_number, row in enumerate(values[1:], start=2):
+            padded = list(row) + [""] * (len(BOTDATA_HEADERS) - len(row))
+            record_type = normalize_name(padded[0])
+            value = clean_text(padded[1])
+
+            if not record_type or not value:
+                continue
+
+            records.append({
+                "type": record_type,
+                "value": value,
+                "category": clean_text(padded[2]),
+                "active": parse_botdata_active(padded[3]),
+                "sort_order": parse_botdata_sort_order(padded[4], row_number * 10),
+                "_row": row_number
+            })
+
+        _botdata_cache["timestamp"] = now
+        _botdata_cache["records"] = records
+
+    result = [
+        record for record in records
+        if (not data_type or record["type"] == data_type)
+        and (not active_only or record["active"])
+    ]
+
+    return sorted(
+        result,
+        key=lambda record: (
+            record["sort_order"],
+            normalize_name(record["value"])
+        )
+    )
+
+
+def get_botdata_values(data_type):
+    return unique_preserve_order([
+        record["value"]
+        for record in get_botdata_records(data_type=data_type)
+    ])
 
 
 def get_botdata_players():
-    return get_botdata_column_values(BOTDATA_COL_PLAYER)
+    return get_botdata_values(BOTDATA_TYPE_PLAYER)
 
 
 def get_botdata_faction_records():
-    botdata = get_botdata_sheet(create=False)
+    return [
+        {
+            "name": canonical_faction(record["value"]),
+            "category": record["category"] or FACTION_CATEGORY_STANDARD_A_M
+        }
+        for record in get_botdata_records(data_type=BOTDATA_TYPE_FACTION)
+    ]
 
-    if botdata is None:
-        return []
 
-    rows = botdata.get_all_records()
-    result = []
+def add_botdata_record(data_type: str, value: str, category=""):
+    value = clean_text(value)
+    category = clean_text(category)
 
-    for row in rows:
-        faction_name = clean_text(row.get("FactionName", ""))
+    if not value:
+        return False, "Leerer Eintrag."
 
-        if not faction_name:
-            continue
+    records = get_botdata_records(
+        data_type=data_type,
+        active_only=False,
+        force_refresh=True
+    )
+    existing = next(
+        (
+            record for record in records
+            if normalize_name(record["value"]) == normalize_name(value)
+        ),
+        None
+    )
+    botdata = ensure_botdata_schema()
 
-        category = clean_text(row.get("FactionCategory", ""))
+    if existing:
+        if not existing["active"]:
+            updates = [["TRUE"]]
+            botdata.update(
+                values=updates,
+                range_name=f"D{existing['_row']}:D{existing['_row']}"
+            )
+            if category and category != existing["category"]:
+                botdata.update(
+                    values=[[category]],
+                    range_name=f"C{existing['_row']}:C{existing['_row']}"
+                )
+            invalidate_botdata_cache()
+            return True, f"**{value}** wurde wieder aktiviert."
 
-        if not category:
-            category = FACTION_CATEGORY_DISCORDANT_STARS
+        return False, f"**{value}** existiert bereits."
 
-        result.append({
-            "name": canonical_faction(faction_name),
-            "category": category
-        })
+    next_sort_order = max(
+        [record["sort_order"] for record in records],
+        default=0
+    ) + 10
+    botdata.append_row(
+        [data_type, value, category, "TRUE", format_number_for_sheet(next_sort_order)],
+        value_input_option="USER_ENTERED"
+    )
+    invalidate_botdata_cache()
 
-    return result
+    return True, f"**{value}** wurde hinzugefügt."
 
 
 def add_botdata_player(name: str):
@@ -644,10 +881,12 @@ def add_botdata_player(name: str):
     if normalize_player_name(name) in [normalize_player_name(p) for p in existing]:
         return False, f"**{name}** existiert bereits."
 
-    botdata = get_botdata_sheet(create=True)
-    botdata.append_row([name, "", "", "", "", ""], value_input_option="USER_ENTERED")
+    success, message = add_botdata_record(BOTDATA_TYPE_PLAYER, name)
 
     _player_name_cache["timestamp"] = 0
+
+    if not success:
+        return success, message
 
     return True, f"Spieler **{name}** wurde hinzugefügt."
 
@@ -663,33 +902,14 @@ def add_botdata_faction(name: str, category: str):
     if normalize_name(name) in [normalize_name(f) for f in existing]:
         return False, f"Volk **{name}** existiert bereits."
 
-    botdata = get_botdata_sheet(create=True)
-    botdata.append_row(["", name, category, "", "", ""], value_input_option="USER_ENTERED")
+    success, message = add_botdata_record(BOTDATA_TYPE_FACTION, name, category)
 
     _faction_name_cache["timestamp"] = 0
 
+    if not success:
+        return success, message
+
     return True, f"Volk **{name}** wurde hinzugefügt."
-
-
-def add_botdata_setting(column_index: int, value: str):
-    value = clean_text(value)
-
-    if not value:
-        return False, "Leerer Eintrag."
-
-    botdata = get_botdata_sheet(create=True)
-
-    existing = get_botdata_column_values(column_index)
-
-    if normalize_name(value) in [normalize_name(v) for v in existing]:
-        return False, f"**{value}** existiert bereits."
-
-    row = ["", "", "", "", "", ""]
-    row[column_index - 1] = value
-
-    botdata.append_row(row, value_input_option="USER_ENTERED")
-
-    return True, f"**{value}** wurde hinzugefügt."
 
 
 def add_botdata_points(value: str):
@@ -705,7 +925,7 @@ def add_botdata_points(value: str):
     if normalize_name(value) in [normalize_name(v) for v in existing]:
         return False, f"**{value}** existiert bereits."
 
-    return add_botdata_setting(BOTDATA_COL_POINTS, value)
+    return add_botdata_record(BOTDATA_TYPE_POINTS, value)
 
 
 def add_botdata_expansion(value: str):
@@ -714,7 +934,7 @@ def add_botdata_expansion(value: str):
     if normalize_name(value) in [normalize_name(v) for v in existing]:
         return False, f"**{value}** existiert bereits."
 
-    return add_botdata_setting(BOTDATA_COL_EXPANSION, value)
+    return add_botdata_record(BOTDATA_TYPE_EXPANSION, value)
 
 
 def add_botdata_modification(value: str):
@@ -723,31 +943,22 @@ def add_botdata_modification(value: str):
     if normalize_name(value) in [normalize_name(v) for v in existing]:
         return False, f"**{value}** existiert bereits."
 
-    return add_botdata_setting(BOTDATA_COL_MODIFICATION, value)
+    return add_botdata_record(BOTDATA_TYPE_MODIFICATION, value)
 
 
 def get_points_options():
-    return unique_preserve_order(
-        DEFAULT_POINTS
-        + get_unique_sheet_column_values("Punkte")
-        + get_botdata_column_values(BOTDATA_COL_POINTS)
-    )
+    return get_botdata_values(BOTDATA_TYPE_POINTS)
 
 
 def get_expansion_options():
     return normalize_expansion_values(
-        DEFAULT_EXPANSIONS
-        + get_unique_sheet_column_values("Erweiterung", split_multi=True)
-        + get_botdata_column_values(BOTDATA_COL_EXPANSION)
+        get_botdata_values(BOTDATA_TYPE_EXPANSION)
     )
 
 
 def get_modification_options():
     values = unique_preserve_order(
-        ["Standard"]
-        + DEFAULT_MODIFICATIONS
-        + get_unique_sheet_column_values("Modifikation", split_multi=True)
-        + get_botdata_column_values(BOTDATA_COL_MODIFICATION)
+        get_botdata_values(BOTDATA_TYPE_MODIFICATION)
     )
 
     filtered = [
@@ -796,27 +1007,12 @@ def get_all_player_names_cached(force_refresh=False):
     ):
         return _player_name_cache["names"]
 
-    rows = get_rows()
     names = set()
 
     for saved_name in get_botdata_players():
         player_name = canonical_player_name(saved_name)
         if player_name and not is_excluded_from_player_dropdown(player_name):
             names.add(player_name)
-
-    for row in rows:
-        for winner in split_winner_names(row.get("Gewinner", "")):
-            if winner and not is_excluded_from_player_dropdown(winner):
-                names.add(winner)
-
-        for community_name in split_community_names(row.get("Community Preis")):
-            if community_name and not is_excluded_from_player_dropdown(community_name):
-                names.add(community_name)
-
-        for player in parse_game_players(get_player_column(row)):
-            player_name = player["name"]
-            if player_name and not is_excluded_from_player_dropdown(player_name):
-                names.add(player_name)
 
     sorted_names = sorted(names, key=lambda x: x.lower())
 
@@ -836,18 +1032,10 @@ def get_all_faction_names_cached(force_refresh=False):
     ):
         return _faction_name_cache["names"]
 
-    rows = get_rows()
-    factions = set(STANDARD_FACTIONS_ALL)
+    factions = set()
 
     for record in get_botdata_faction_records():
         factions.add(canonical_faction(record["name"]))
-
-    for row in rows:
-        for player in parse_game_players(get_player_column(row)):
-            faction = player.get("faction")
-
-            if faction and faction != "Unbekannt":
-                factions.add(canonical_faction(faction))
 
     sorted_factions = sorted(factions, key=lambda x: x.lower())
 
@@ -858,22 +1046,8 @@ def get_all_faction_names_cached(force_refresh=False):
 
 
 def get_factions_for_category(category: str):
-    if category == FACTION_CATEGORY_STANDARD_N_Z:
-        base_factions = STANDARD_FACTIONS_N_Z
-    elif category == FACTION_CATEGORY_TWILIGHTS_FALL:
-        base_factions = TWILIGHTS_FALL_FACTIONS
-    elif category == FACTION_CATEGORY_DISCORDANT_STARS:
-        base_factions = DISCORDANT_STARS_FACTIONS
-    else:
-        base_factions = STANDARD_FACTIONS_A_M
-
     result = []
     seen = set()
-
-    for faction in base_factions:
-        faction = canonical_faction(faction)
-        result.append(faction)
-        seen.add(normalize_name(faction))
 
     for record in get_botdata_faction_records():
         if record["category"] != category:
@@ -5264,6 +5438,12 @@ async def session_cleanup(interaction: discord.Interaction):
 # =========================================================
 @client.event
 async def on_ready():
+    try:
+        ensure_botdata_schema()
+        get_botdata_records(force_refresh=True)
+    except Exception as exc:
+        print(f"BotData konnte beim Start nicht vorbereitet werden: {exc}")
+
     try:
         sort_sessions_sheet_by_start()
     except Exception as exc:
