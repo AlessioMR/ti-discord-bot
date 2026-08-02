@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import tasks
+import asyncio
 import gspread
 from gspread.exceptions import WorksheetNotFound
 from gspread.utils import rowcol_to_a1
@@ -40,7 +41,7 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "botdata-sheet-only-v12"
+BOT_BUILD = "async-sheet-cache-v13"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -49,7 +50,14 @@ sheet = spreadsheet.sheet1
 # 🤖 DISCORD SETUP
 # =========================================================
 intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+
+
+class MecatolClient(discord.Client):
+    async def setup_hook(self):
+        await setup_bot_backend()
+
+
+client = MecatolClient(intents=intents)
 tree = app_commands.CommandTree(client)
 
 statistics = app_commands.Group(
@@ -89,7 +97,7 @@ BOTDATA_TYPE_EXPANSION = "expansion"
 BOTDATA_TYPE_MODIFICATION = "modification"
 
 BOTDATA_ACTIVE_VALUES = {"1", "true", "yes", "ja", "y", "x"}
-BOTDATA_CACHE_SECONDS = 300
+SESSION_CACHE_SECONDS = 30
 
 FACTION_CATEGORY_STANDARD_A_M = "standard_a_m"
 FACTION_CATEGORY_STANDARD_N_Z = "standard_n_z"
@@ -134,15 +142,31 @@ _player_name_cache = {
     "names": []
 }
 
-_faction_name_cache = {
-    "timestamp": 0,
-    "names": []
-}
-
 _botdata_cache = {
     "timestamp": 0,
     "records": []
 }
+
+_game_rows_cache = {
+    "timestamp": 0,
+    "rows": []
+}
+
+_game_headers_cache = []
+
+_session_records_cache = {
+    "timestamp": 0,
+    "records": []
+}
+
+_botdata_worksheet = None
+_sessions_worksheet = None
+_sheets_io_lock = asyncio.Lock()
+
+
+async def run_sheet_io(function, *args, **kwargs):
+    async with _sheets_io_lock:
+        return await asyncio.to_thread(function, *args, **kwargs)
 
 
 def normalize_name(name: str) -> str:
@@ -310,8 +334,27 @@ def parse_date_for_sort(value: str):
         return None
 
 
-def get_rows():
-    return sheet.get_all_records()
+def set_game_rows_cache(rows):
+    _game_rows_cache["timestamp"] = time.time()
+    _game_rows_cache["rows"] = [dict(row) for row in rows]
+
+
+def get_rows(force_refresh=False):
+    if not force_refresh and _game_rows_cache["timestamp"]:
+        return [dict(row) for row in _game_rows_cache["rows"]]
+
+    rows = sheet.get_all_records()
+    set_game_rows_cache(rows)
+    return [dict(row) for row in rows]
+
+
+def get_game_headers():
+    if _game_headers_cache:
+        return list(_game_headers_cache)
+
+    headers = sheet.row_values(1)
+    _game_headers_cache.extend(headers)
+    return list(headers)
 
 
 def get_player_column(row):
@@ -336,23 +379,6 @@ def split_multi_value_cell(value: str):
     parts = [part.strip() for part in value.split("+")]
 
     return [part for part in parts if part]
-
-
-def get_unique_sheet_column_values(column_name, split_multi=False):
-    values = []
-
-    for row in get_rows():
-        value = clean_text(row.get(column_name, ""))
-
-        if not value:
-            continue
-
-        if split_multi:
-            values.extend(split_multi_value_cell(value))
-        else:
-            values.append(value)
-
-    return unique_preserve_order(values)
 
 
 def split_player_names_cell(entry: str):
@@ -497,6 +523,11 @@ def parse_game_players(raw: str):
 
 
 def get_botdata_sheet(create=False):
+    global _botdata_worksheet
+
+    if _botdata_worksheet is not None:
+        return _botdata_worksheet
+
     try:
         botdata = spreadsheet.worksheet(BOTDATA_SHEET_NAME)
     except WorksheetNotFound:
@@ -514,17 +545,13 @@ def get_botdata_sheet(create=False):
             range_name="A1:E1"
         )
 
+    _botdata_worksheet = botdata
     return botdata
 
 
 def botdata_headers_match(values, expected_headers):
     normalized = [clean_text(value) for value in values[:len(expected_headers)]]
     return normalized == expected_headers
-
-
-def invalidate_botdata_cache():
-    _botdata_cache["timestamp"] = 0
-    _botdata_cache["records"] = []
 
 
 def parse_botdata_active(value):
@@ -537,9 +564,9 @@ def parse_botdata_sort_order(value, fallback):
     return number if number is not None else fallback
 
 
-def ensure_botdata_schema():
-    botdata = get_botdata_sheet(create=True)
-    values = botdata.get_all_values()
+def ensure_botdata_schema(botdata=None, values=None):
+    botdata = botdata or get_botdata_sheet(create=True)
+    values = values if values is not None else botdata.get_all_values()
 
     if not values:
         botdata.update(
@@ -562,13 +589,13 @@ def get_botdata_records(data_type=None, active_only=True, force_refresh=False):
 
     if (
         not force_refresh
-        and now - _botdata_cache["timestamp"] < BOTDATA_CACHE_SECONDS
-        and _botdata_cache["records"]
+        and _botdata_cache["timestamp"]
     ):
         records = _botdata_cache["records"]
     else:
-        botdata = ensure_botdata_schema()
+        botdata = get_botdata_sheet(create=True)
         values = botdata.get_all_values()
+        ensure_botdata_schema(botdata=botdata, values=values)
         records = []
 
         for row_number, row in enumerate(values[1:], start=2):
@@ -606,15 +633,21 @@ def get_botdata_records(data_type=None, active_only=True, force_refresh=False):
     )
 
 
-def get_botdata_values(data_type):
+def get_botdata_values(data_type, force_refresh=False):
     return unique_preserve_order([
         record["value"]
-        for record in get_botdata_records(data_type=data_type)
+        for record in get_botdata_records(
+            data_type=data_type,
+            force_refresh=force_refresh
+        )
     ])
 
 
-def get_botdata_players():
-    return get_botdata_values(BOTDATA_TYPE_PLAYER)
+def get_botdata_players(force_refresh=False):
+    return get_botdata_values(
+        BOTDATA_TYPE_PLAYER,
+        force_refresh=force_refresh
+    )
 
 
 def get_botdata_faction_records():
@@ -636,8 +669,7 @@ def add_botdata_record(data_type: str, value: str, category=""):
 
     records = get_botdata_records(
         data_type=data_type,
-        active_only=False,
-        force_refresh=True
+        active_only=False
     )
     existing = next(
         (
@@ -646,7 +678,7 @@ def add_botdata_record(data_type: str, value: str, category=""):
         ),
         None
     )
-    botdata = ensure_botdata_schema()
+    botdata = get_botdata_sheet(create=True)
 
     if existing:
         if not existing["active"]:
@@ -660,7 +692,9 @@ def add_botdata_record(data_type: str, value: str, category=""):
                     values=[[category]],
                     range_name=f"C{existing['_row']}:C{existing['_row']}"
                 )
-            invalidate_botdata_cache()
+                existing["category"] = category
+            existing["active"] = True
+            _botdata_cache["timestamp"] = time.time()
             return True, f"**{value}** wurde wieder aktiviert."
 
         return False, f"**{value}** existiert bereits."
@@ -673,7 +707,19 @@ def add_botdata_record(data_type: str, value: str, category=""):
         [data_type, value, category, "TRUE", format_number_for_sheet(next_sort_order)],
         value_input_option="USER_ENTERED"
     )
-    invalidate_botdata_cache()
+    next_row = max(
+        [record.get("_row", 1) for record in _botdata_cache["records"]],
+        default=1
+    ) + 1
+    _botdata_cache["records"].append({
+        "type": data_type,
+        "value": value,
+        "category": category,
+        "active": True,
+        "sort_order": next_sort_order,
+        "_row": next_row
+    })
+    _botdata_cache["timestamp"] = time.time()
 
     return True, f"**{value}** wurde hinzugefügt."
 
@@ -683,11 +729,6 @@ def add_botdata_player(name: str):
 
     if not name:
         return False, "Leerer Spielername."
-
-    existing = get_all_player_names_cached(force_refresh=True)
-
-    if normalize_player_name(name) in [normalize_player_name(p) for p in existing]:
-        return False, f"**{name}** existiert bereits."
 
     success, message = add_botdata_record(BOTDATA_TYPE_PLAYER, name)
 
@@ -705,14 +746,7 @@ def add_botdata_faction(name: str, category: str):
     if not name:
         return False, "Leerer Völkername."
 
-    existing = get_all_faction_names_cached(force_refresh=True)
-
-    if normalize_name(name) in [normalize_name(f) for f in existing]:
-        return False, f"Volk **{name}** existiert bereits."
-
     success, message = add_botdata_record(BOTDATA_TYPE_FACTION, name, category)
-
-    _faction_name_cache["timestamp"] = 0
 
     if not success:
         return success, message
@@ -728,29 +762,14 @@ def add_botdata_points(value: str):
 
     value = format_number_for_sheet(number)
 
-    existing = get_points_options()
-
-    if normalize_name(value) in [normalize_name(v) for v in existing]:
-        return False, f"**{value}** existiert bereits."
-
     return add_botdata_record(BOTDATA_TYPE_POINTS, value)
 
 
 def add_botdata_expansion(value: str):
-    existing = get_expansion_options()
-
-    if normalize_name(value) in [normalize_name(v) for v in existing]:
-        return False, f"**{value}** existiert bereits."
-
     return add_botdata_record(BOTDATA_TYPE_EXPANSION, value)
 
 
 def add_botdata_modification(value: str):
-    existing = get_modification_options()
-
-    if normalize_name(value) in [normalize_name(v) for v in existing]:
-        return False, f"**{value}** existiert bereits."
-
     return add_botdata_record(BOTDATA_TYPE_MODIFICATION, value)
 
 
@@ -805,52 +824,26 @@ def format_modifications_for_sheet(state):
     return " + ".join(clean_selected_values(state.modifikationen))
 
 
-def get_all_player_names_cached(force_refresh=False):
-    now = time.time()
-
-    if (
-        not force_refresh
-        and now - _player_name_cache["timestamp"] < 300
-        and _player_name_cache["names"]
-    ):
+def get_all_player_names_cached(force_refresh=False, cache_only=False):
+    if not force_refresh and _player_name_cache["timestamp"]:
         return _player_name_cache["names"]
+
+    if cache_only and not _botdata_cache["timestamp"]:
+        return []
 
     names = set()
 
-    for saved_name in get_botdata_players():
+    for saved_name in get_botdata_players(force_refresh=force_refresh):
         player_name = canonical_player_name(saved_name)
         if player_name and not is_excluded_from_player_dropdown(player_name):
             names.add(player_name)
 
     sorted_names = sorted(names, key=lambda x: x.lower())
 
-    _player_name_cache["timestamp"] = now
+    _player_name_cache["timestamp"] = time.time()
     _player_name_cache["names"] = sorted_names
 
     return sorted_names
-
-
-def get_all_faction_names_cached(force_refresh=False):
-    now = time.time()
-
-    if (
-        not force_refresh
-        and now - _faction_name_cache["timestamp"] < 300
-        and _faction_name_cache["names"]
-    ):
-        return _faction_name_cache["names"]
-
-    factions = set()
-
-    for record in get_botdata_faction_records():
-        factions.add(canonical_faction(record["name"]))
-
-    sorted_factions = sorted(factions, key=lambda x: x.lower())
-
-    _faction_name_cache["timestamp"] = now
-    _faction_name_cache["names"] = sorted_factions
-
-    return sorted_factions
 
 
 def get_factions_for_category(category: str):
@@ -955,7 +948,7 @@ async def player_name_autocomplete(
     interaction: discord.Interaction,
     current: str
 ):
-    names = get_all_player_names_cached()
+    names = get_all_player_names_cached(cache_only=True)
     current_lower = current.lower()
 
     if current_lower:
@@ -997,71 +990,6 @@ def format_count_sieg(count: int):
 
 def format_count_preis(count: int):
     return "1-facher Preisträger" if count == 1 else f"{count}-facher Preisträger"
-
-
-def format_winrate(wins: int, games: int):
-    if games == 0:
-        return "0.0%"
-    return f"{(wins / games) * 100:.1f}%"
-
-
-def get_next_available_sheet_row():
-    all_values = sheet.get_all_values()
-
-    last_non_empty_row = 1
-
-    for index, row in enumerate(all_values, start=1):
-        if any(str(cell).strip() for cell in row):
-            last_non_empty_row = index
-
-    return max(last_non_empty_row + 1, 2)
-
-
-def sort_sheet_by_date():
-    all_values = sheet.get_all_values()
-
-    if not all_values:
-        return
-
-    headers = all_values[0]
-
-    if "Datum" not in headers:
-        return
-
-    date_index = headers.index("Datum")
-    width = len(headers)
-
-    non_empty_rows = []
-
-    for row in all_values[1:]:
-        padded_row = row + [""] * (width - len(row))
-        padded_row = padded_row[:width]
-
-        if any(str(cell).strip() for cell in padded_row):
-            non_empty_rows.append(padded_row)
-
-    def sort_key(row):
-        parsed_date = parse_date_for_sort(row[date_index])
-
-        if parsed_date is None:
-            return (1, datetime.max)
-
-        return (0, parsed_date)
-
-    sorted_rows = sorted(non_empty_rows, key=sort_key)
-
-    last_row_to_clear = max(len(all_values), len(sorted_rows) + 1)
-    last_col = rowcol_to_a1(1, width).replace("1", "")
-
-    sheet.batch_clear([f"A2:{last_col}{last_row_to_clear}"])
-
-    if sorted_rows:
-        end_cell = rowcol_to_a1(len(sorted_rows) + 1, width)
-        sheet.update(
-            values=sorted_rows,
-            range_name=f"A2:{end_cell}",
-            value_input_option="USER_ENTERED"
-        )
 
 
 # =========================================================
@@ -1493,26 +1421,39 @@ def append_game_to_sheet(state: AddGameState):
         "Kommentare": state.kommentare
     }
 
-    headers = sheet.row_values(1)
+    headers = get_game_headers()
 
     row = [
         row_data.get(header, "")
         for header in headers
     ]
 
-    next_row = get_next_available_sheet_row()
-    end_cell = rowcol_to_a1(next_row, len(headers))
+    existing_rows = get_rows()
+    new_date = parse_date_for_sort(state.datum)
+    insert_index = 2
 
-    sheet.update(
-        values=[row],
-        range_name=f"A{next_row}:{end_cell}",
+    for existing in existing_rows:
+        existing_date = parse_date_for_sort(existing.get("Datum", ""))
+
+        if existing_date is None:
+            break
+
+        if new_date is not None and existing_date > new_date:
+            break
+
+        insert_index += 1
+
+    sheet.insert_row(
+        row,
+        index=insert_index,
         value_input_option="USER_ENTERED"
     )
 
-    sort_sheet_by_date()
+    updated_rows = list(existing_rows)
+    updated_rows.insert(insert_index - 2, row_data)
+    set_game_rows_cache(updated_rows)
 
     _player_name_cache["timestamp"] = 0
-    _faction_name_cache["timestamp"] = 0
 
 
 def add_external_players_to_state(state: AddGameState, count: int):
@@ -1758,12 +1699,14 @@ class CustomSettingModal(discord.ui.Modal):
                 return
 
             value = format_number_for_sheet(number)
-            add_botdata_points(value)
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await run_sheet_io(add_botdata_points, value)
             self.state.punkte = value
             label = "Punkte"
 
         elif self.setting_type == "expansion":
-            add_botdata_expansion(value)
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await run_sheet_io(add_botdata_expansion, value)
 
             current = [
                 expansion for expansion in self.state.erweiterungen
@@ -1775,7 +1718,8 @@ class CustomSettingModal(discord.ui.Modal):
             label = "Erweiterung"
 
         else:
-            add_botdata_modification(value)
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await run_sheet_io(add_botdata_modification, value)
 
             current = [
                 modification for modification in self.state.modifikationen
@@ -1786,10 +1730,9 @@ class CustomSettingModal(discord.ui.Modal):
             self.state.modifikationen = clean_selected_values(current)
             label = "Modifikation"
 
-        await interaction.response.send_message(
-            f"{label} **{value}** wurde gesetzt.\n\nSchritt 1: Prüfe die Auswahl und klicke auf Weiter.",
+        await interaction.edit_original_response(
+            content=f"{label} **{value}** wurde gesetzt.\n\nSchritt 1: Prüfe die Auswahl und klicke auf Weiter.",
             view=GameSettingsSelectionView(self.state),
-            ephemeral=True
         )
 
 
@@ -1968,7 +1911,11 @@ class CustomPlayerModal(discord.ui.Modal, title="Neuen Spieler eintragen"):
 
         final_name = canonical_player_name(raw_name)
 
-        existing_names = get_all_player_names_cached(force_refresh=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        existing_names = await run_sheet_io(
+            get_all_player_names_cached,
+            force_refresh=True
+        )
         existing_match = next(
             (
                 name for name in existing_names
@@ -1981,32 +1928,32 @@ class CustomPlayerModal(discord.ui.Modal, title="Neuen Spieler eintragen"):
             final_name = existing_match
             message = f"Spieler **{final_name}** existiert bereits und wurde ausgewählt."
         else:
-            success, message = add_botdata_player(final_name)
+            success, message = await run_sheet_io(
+                add_botdata_player,
+                final_name
+            )
 
             if not success and "existiert bereits" not in message:
-                await interaction.response.send_message(
-                    message,
-                    ephemeral=True
+                await interaction.edit_original_response(
+                    content=message
                 )
                 return
 
         if normalize_player_name(final_name) not in [normalize_player_name(p) for p in self.state.participants]:
             if len(self.state.participants) >= MAX_PLAYERS_PER_GAME:
-                await interaction.response.send_message(
-                    "Es sind bereits 8 Spieler ausgewählt. Entferne erst einen Spieler, bevor du einen neuen hinzufügst.",
-                    ephemeral=True
+                await interaction.edit_original_response(
+                    content="Es sind bereits 8 Spieler ausgewählt. Entferne erst einen Spieler, bevor du einen neuen hinzufügst."
                 )
                 return
 
             self.state.participants.append(final_name)
 
-        player_names = get_all_player_names_cached(force_refresh=True)
+        player_names = get_all_player_names_cached()
         view = PlayerAsyncSelectionView(self.state, player_names)
 
-        await interaction.response.send_message(
-            f"{message}\n\nSchritt 2: Prüfe ASYNC und Spielerauswahl, dann klicke auf Weiter.",
+        await interaction.edit_original_response(
+            content=f"{message}\n\nSchritt 2: Prüfe ASYNC und Spielerauswahl, dann klicke auf Weiter.",
             view=view,
-            ephemeral=True
         )
 
 
@@ -2041,7 +1988,7 @@ class ExternalPlayersModal(discord.ui.Modal, title="Externe Spieler hinzufügen"
 
         added = add_external_players_to_state(self.state, requested_amount)
 
-        player_names = get_all_player_names_cached(force_refresh=True)
+        player_names = get_all_player_names_cached()
         view = PlayerAsyncSelectionView(self.state, player_names)
 
         await interaction.response.send_message(
@@ -2396,15 +2343,15 @@ class CustomFactionModal(discord.ui.Modal, title="Neues Volk eintragen"):
 
         detail["faction"] = faction_name
 
-        add_botdata_faction(faction_name, category)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await run_sheet_io(add_botdata_faction, faction_name, category)
 
-        await interaction.response.send_message(
+        await interaction.edit_original_response(
             content=(
                 f"Volk **{faction_name}** wurde für **{player_name}** gesetzt.\n\n"
                 f"{build_player_detail_content(self.state, self.index)}"
             ),
             view=PlayerDetailView(self.state, self.index),
-            ephemeral=True
         )
 
 
@@ -2501,7 +2448,7 @@ class ConfirmGameView(OwnerOnlyView):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            append_game_to_sheet(self.state)
+            await run_sheet_io(append_game_to_sheet, self.state)
         except Exception as e:
             await interaction.followup.send(
                 f"Fehler beim Schreiben ins Google Sheet:\n```text\n{e}\n```",
@@ -2593,6 +2540,11 @@ class SessionDraft:
 
 
 def get_sessions_sheet(create=False):
+    global _sessions_worksheet
+
+    if _sessions_worksheet is not None:
+        return _sessions_worksheet
+
     try:
         worksheet = spreadsheet.worksheet(SESSIONS_SHEET_NAME)
     except WorksheetNotFound:
@@ -2608,6 +2560,7 @@ def get_sessions_sheet(create=False):
             values=[SESSION_HEADERS],
             range_name=f"A1:{rowcol_to_a1(1, len(SESSION_HEADERS))}"
         )
+        _sessions_worksheet = worksheet
         return worksheet
 
     first_row = worksheet.row_values(1)
@@ -2623,7 +2576,13 @@ def get_sessions_sheet(create=False):
             "Bitte die Kopfzeile nicht manuell verändern."
         )
 
+    _sessions_worksheet = worksheet
     return worksheet
+
+
+def invalidate_session_records_cache():
+    _session_records_cache["timestamp"] = 0
+    _session_records_cache["records"] = []
 
 
 def parse_session_datetime(date_value: str, time_value: str) -> datetime:
@@ -2750,44 +2709,54 @@ def format_session_message(record, heading: str) -> str:
     )
 
 
-def get_session_records(guild_id=None, active_only=False):
-    worksheet = get_sessions_sheet(create=False)
+def get_session_records(guild_id=None, active_only=False, force_refresh=False):
+    now = time.time()
 
-    if worksheet is None:
-        return []
+    if (
+        not force_refresh
+        and _session_records_cache["timestamp"]
+        and now - _session_records_cache["timestamp"] < SESSION_CACHE_SECONDS
+    ):
+        records = _session_records_cache["records"]
+    else:
+        worksheet = get_sessions_sheet(create=False)
 
-    values = worksheet.get_all_values()
+        if worksheet is None:
+            return []
 
-    if len(values) < 2:
-        return []
+        values = worksheet.get_all_values()
+        records = []
 
-    headers = values[0]
-    records = []
+        if len(values) >= 2:
+            headers = values[0]
 
-    for row_index, row in enumerate(values[1:], start=2):
-        padded_row = row + [""] * max(0, len(headers) - len(row))
-        record = dict(zip(headers, padded_row))
-        record["_row"] = row_index
+            for row_index, row in enumerate(values[1:], start=2):
+                padded_row = row + [""] * max(0, len(headers) - len(row))
+                record = dict(zip(headers, padded_row))
+                record["_row"] = row_index
 
-        if not str(record.get("SessionID", "")).strip():
-            continue
+                if str(record.get("SessionID", "")).strip():
+                    records.append(record)
 
-        if guild_id is not None and str(record.get("GuildID")) != str(guild_id):
-            continue
+        _session_records_cache["timestamp"] = now
+        _session_records_cache["records"] = records
 
-        if active_only and str(record.get("Status", "")).lower() != "active":
-            continue
-
-        records.append(record)
-
-    return records
+    return [
+        dict(record)
+        for record in records
+        if (guild_id is None or str(record.get("GuildID")) == str(guild_id))
+        and (
+            not active_only
+            or str(record.get("Status", "")).lower() == "active"
+        )
+    ]
 
 
 def append_session_record(record):
     worksheet = get_sessions_sheet(create=True)
     row = [str(record.get(header, "") or "") for header in SESSION_HEADERS]
     worksheet.append_row(row, value_input_option="RAW")
-    return len(worksheet.get_all_values())
+    invalidate_session_records_cache()
 
 
 def update_session_record(row_number: int, updates: dict):
@@ -2806,50 +2775,70 @@ def update_session_record(row_number: int, updates: dict):
 
     if cells:
         worksheet.update_cells(cells, value_input_option="RAW")
+        invalidate_session_records_cache()
 
 
-def delete_session_record(row_number: int):
-    worksheet = get_sessions_sheet(create=False)
-
-    if worksheet is not None:
-        worksheet.delete_rows(int(row_number))
-
-
-def sort_sessions_sheet_by_start():
+def sort_sessions_sheet_by_start(last_row=None):
     worksheet = get_sessions_sheet(create=False)
 
     if worksheet is None:
         return
 
-    values = worksheet.get_all_values()
+    if last_row is None:
+        values = worksheet.get_all_values()
+        last_row = len(values)
 
-    if len(values) < 3:
+    last_row = int(last_row or 0)
+
+    if last_row < 3:
         return
 
-    headers = values[0]
-
-    if "StartUTC" not in headers:
-        return
-
-    start_column = headers.index("StartUTC") + 1
-    last_column = rowcol_to_a1(1, len(headers)).replace("1", "")
+    start_column = SESSION_HEADERS.index("StartUTC") + 1
+    last_column = rowcol_to_a1(1, len(SESSION_HEADERS)).replace("1", "")
     worksheet.sort(
         (start_column, "asc"),
-        range=f"A2:{last_column}{len(values)}"
+        range=f"A2:{last_column}{last_row}"
     )
+    invalidate_session_records_cache()
 
 
-def delete_session_records(row_numbers):
+def delete_session_records(row_numbers, last_row=None):
     sorted_rows = sorted(
         {int(row) for row in row_numbers if row},
         reverse=True
     )
 
-    for row_number in sorted_rows:
-        delete_session_record(row_number)
+    if not sorted_rows:
+        return
 
-    if sorted_rows:
-        sort_sessions_sheet_by_start()
+    ranges = []
+    range_end = sorted_rows[0]
+    range_start = range_end
+
+    for row_number in sorted_rows[1:]:
+        if row_number == range_start - 1:
+            range_start = row_number
+        else:
+            ranges.append((range_start, range_end))
+            range_start = row_number
+            range_end = row_number
+
+    ranges.append((range_start, range_end))
+    worksheet = get_sessions_sheet(create=False)
+
+    if worksheet is None:
+        return
+
+    for start_row, end_row in ranges:
+        worksheet.delete_rows(start_row, end_row)
+
+    invalidate_session_records_cache()
+    remaining_last_row = (
+        max(1, int(last_row) - len(sorted_rows))
+        if last_row is not None
+        else None
+    )
+    sort_sessions_sheet_by_start(last_row=remaining_last_row)
 
 
 def delete_session_records_for_event(record) -> int:
@@ -2877,8 +2866,9 @@ def upsert_session_record(record, preferred_row=None) -> int:
     if not event_id:
         raise ValueError("Eine Session kann ohne Discord-Event-ID nicht gespeichert werden.")
 
+    all_records = get_session_records(active_only=False, force_refresh=True)
     matching_records = [
-        existing for existing in get_session_records(active_only=False)
+        existing for existing in all_records
         if str(existing.get("EventID", "")).strip() == event_id
     ]
     matching_rows = {
@@ -2895,13 +2885,13 @@ def upsert_session_record(record, preferred_row=None) -> int:
     elif preferred_row:
         target_row = preferred_row
     else:
+        target_row = max(
+            [int(existing.get("_row", 1)) for existing in all_records],
+            default=1
+        ) + 1
         append_session_record(record)
-        sort_sessions_sheet_by_start()
-        matching_after_sort = [
-            existing for existing in get_session_records(active_only=False)
-            if str(existing.get("EventID", "")).strip() == event_id
-        ]
-        return matching_after_sort[0]["_row"]
+        sort_sessions_sheet_by_start(last_row=target_row)
+        return target_row
 
     existing_record = matching_rows.get(target_row)
 
@@ -2922,39 +2912,21 @@ def upsert_session_record(record, preferred_row=None) -> int:
         row_number for row_number in matching_rows
         if row_number != target_row
     ]
-    delete_session_records(duplicate_rows)
-    sort_sessions_sheet_by_start()
-    matching_after_sort = [
-        existing for existing in get_session_records(active_only=False)
-        if str(existing.get("EventID", "")).strip() == event_id
-    ]
-    return matching_after_sort[0]["_row"]
 
+    if duplicate_rows:
+        last_row = max(
+            [int(existing.get("_row", 1)) for existing in all_records],
+            default=1
+        )
+        delete_session_records(duplicate_rows, last_row=last_row)
+    else:
+        last_row = max(
+            [int(existing.get("_row", 1)) for existing in all_records],
+            default=target_row
+        )
+        sort_sessions_sheet_by_start(last_row=last_row)
 
-def find_session_record(interaction: discord.Interaction, session_id: str = ""):
-    records = get_session_records(
-        guild_id=interaction.guild_id,
-        active_only=True
-    )
-
-    session_id = str(session_id or "").strip().lower()
-
-    if session_id:
-        for record in records:
-            if str(record.get("SessionID", "")).lower() == session_id:
-                return record
-        return None
-
-    channel_records = [
-        record for record in records
-        if str(record.get("ChannelID")) == str(interaction.channel_id)
-    ]
-
-    if not channel_records:
-        return None
-
-    channel_records.sort(key=session_datetime_from_record)
-    return channel_records[0]
+    return target_row
 
 
 def can_manage_session(interaction: discord.Interaction, record) -> bool:
@@ -3218,7 +3190,7 @@ async def finalize_session_creation(
         return
 
     try:
-        record["_row"] = upsert_session_record(record)
+        record["_row"] = await run_sheet_io(upsert_session_record, record)
     except Exception as exc:
         rollback_warning = ""
 
@@ -3760,7 +3732,8 @@ async def finalize_linked_session_edit(
     record.update(updates)
 
     try:
-        record["_row"] = upsert_session_record(
+        record["_row"] = await run_sheet_io(
+            upsert_session_record,
             record,
             preferred_row=record.get("_row")
         )
@@ -3868,7 +3841,10 @@ async def finalize_native_session_edit(
         return
 
     try:
-        linked_record["_row"] = upsert_session_record(linked_record)
+        linked_record["_row"] = await run_sheet_io(
+            upsert_session_record,
+            linked_record
+        )
     except Exception as exc:
         await interaction.edit_original_response(
             content=(
@@ -4103,7 +4079,10 @@ async def get_selectable_server_session_records(
     interaction: discord.Interaction,
     require_manage: bool
 ):
-    all_sheet_records = get_session_records(active_only=False)
+    all_sheet_records = await run_sheet_io(
+        get_session_records,
+        active_only=False
+    )
     sheet_records = [
         record for record in all_sheet_records
         if str(record.get("GuildID")) == str(interaction.guild_id)
@@ -4138,7 +4117,8 @@ async def get_selectable_server_session_records(
         record = records_by_event_id.get(str(event.id))
 
         if record is not None:
-            repair_session_ids_from_native_event(
+            await run_sheet_io(
+                repair_session_ids_from_native_event,
                 interaction.guild_id,
                 record,
                 event
@@ -4193,7 +4173,10 @@ async def build_session_cleanup_plan(guild):
             discord.EventStatus.active
         }
     }
-    records = get_session_records(active_only=False)
+    records = await run_sheet_io(
+        get_session_records,
+        active_only=False
+    )
     guild_records = [
         record for record in records
         if str(record.get("GuildID", "")) == str(guild.id)
@@ -4292,10 +4275,14 @@ async def perform_session_cancellation(
 
     if record.get("_row"):
         try:
-            delete_session_records_for_event(record)
+            await run_sheet_io(delete_session_records_for_event, record)
         except Exception as exc:
             try:
-                update_session_record(record["_row"], {"Status": "cancelled"})
+                await run_sheet_io(
+                    update_session_record,
+                    record["_row"],
+                    {"Status": "cancelled"}
+                )
             except Exception:
                 pass
 
@@ -4424,9 +4411,11 @@ class SessionCancelConfirmView(discord.ui.View):
         if not record.get("_native_only"):
             try:
                 session_id = str(record.get("SessionID"))
-                fresh_records = get_session_records(
+                fresh_records = await run_sheet_io(
+                    get_session_records,
                     guild_id=interaction.guild_id,
-                    active_only=False
+                    active_only=False,
+                    force_refresh=True
                 )
                 record = next(
                     (
@@ -4511,7 +4500,11 @@ class SessionCleanupConfirmView(discord.ui.View):
 
         try:
             plan = await build_session_cleanup_plan(interaction.guild)
-            apply_session_cleanup_plan(interaction.guild, plan)
+            await run_sheet_io(
+                apply_session_cleanup_plan,
+                interaction.guild,
+                plan
+            )
         except Exception as exc:
             await interaction.edit_original_response(
                 content=f"Die Bereinigung ist fehlgeschlagen:\n```text\n{exc}\n```",
@@ -4738,7 +4731,8 @@ async def open_session_action_picker(
                 require_manage=require_manage
             )
         else:
-            records = get_session_records(
+            records = await run_sheet_io(
+                get_session_records,
                 guild_id=interaction.guild_id,
                 active_only=True
             )
@@ -4810,7 +4804,12 @@ async def resolve_session_channel(record):
         if native_event is None:
             continue
 
-        repair_session_ids_from_native_event(guild.id, record, native_event)
+        await run_sheet_io(
+            repair_session_ids_from_native_event,
+            guild.id,
+            record,
+            native_event
+        )
 
         try:
             repaired_channel_id = int(record.get("ChannelID", 0))
@@ -4833,7 +4832,11 @@ async def resolve_session_channel(record):
 @tasks.loop(minutes=5)
 async def session_reminder_loop():
     try:
-        records = get_session_records(active_only=True)
+        records = await run_sheet_io(
+            get_session_records,
+            active_only=True,
+            force_refresh=True
+        )
     except Exception as exc:
         print(f"Session-Reminder: Google-Sheet-Fehler: {exc}")
         return
@@ -4849,10 +4852,14 @@ async def session_reminder_loop():
 
         if start_utc <= now_utc:
             try:
-                delete_session_records_for_event(record)
+                await run_sheet_io(delete_session_records_for_event, record)
             except Exception as exc:
                 try:
-                    update_session_record(record["_row"], {"Status": "completed"})
+                    await run_sheet_io(
+                        update_session_record,
+                        record["_row"],
+                        {"Status": "completed"}
+                    )
                 except Exception:
                     pass
                 print(f"Session-Reminder: Abgelaufene Session konnte nicht entfernt werden: {exc}")
@@ -4881,7 +4888,8 @@ async def session_reminder_loop():
                 "Termin Erinnerung!"
             )
             sent_days.update(due_days)
-            update_session_record(
+            await run_sheet_io(
+                update_session_record,
                 record["_row"],
                 {"SentReminderDays": serialize_number_list(sorted(sent_days, reverse=True))}
             )
@@ -4894,6 +4902,47 @@ async def before_session_reminder_loop():
     await client.wait_until_ready()
 
 
+def refresh_reference_data():
+    get_botdata_records(force_refresh=True)
+    _player_name_cache["timestamp"] = 0
+    get_all_player_names_cached()
+    get_rows(force_refresh=True)
+
+
+@tasks.loop(minutes=5)
+async def reference_data_refresh_loop():
+    try:
+        await run_sheet_io(refresh_reference_data)
+    except Exception as exc:
+        print(f"Stammdaten-Cache konnte nicht aktualisiert werden: {exc}")
+
+
+@reference_data_refresh_loop.before_loop
+async def before_reference_data_refresh_loop():
+    await client.wait_until_ready()
+    await asyncio.sleep(300)
+
+
+async def setup_bot_backend():
+    try:
+        await run_sheet_io(refresh_reference_data)
+    except Exception as exc:
+        print(f"Stammdaten konnten beim Start nicht geladen werden: {exc}")
+
+    try:
+        await run_sheet_io(sort_sessions_sheet_by_start)
+    except Exception as exc:
+        print(f"Sessions-Sheet konnte beim Start nicht sortiert werden: {exc}")
+
+    if not session_reminder_loop.is_running():
+        session_reminder_loop.start()
+
+    if not reference_data_refresh_loop.is_running():
+        reference_data_refresh_loop.start()
+
+    await tree.sync()
+
+
 # =========================================================
 # 🏆 /statistics halloffame
 # =========================================================
@@ -4904,7 +4953,7 @@ async def before_session_reminder_loop():
 async def halloffame(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    data = get_halloffame()
+    data = await run_sheet_io(get_halloffame)
 
     text = ""
 
@@ -4942,7 +4991,7 @@ async def halloffame(interaction: discord.Interaction):
 async def siegerderherzen(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    data = get_community()
+    data = await run_sheet_io(get_community)
 
     text = ""
 
@@ -4987,7 +5036,7 @@ async def siegerderherzen(interaction: discord.Interaction):
 async def player(interaction: discord.Interaction, name: str):
     await interaction.response.defer()
 
-    stats = get_player_stats(name)
+    stats = await run_sheet_io(get_player_stats, name)
 
     factions_text = "\n".join(
         f"• {faction}: {count}x"
@@ -5062,7 +5111,7 @@ async def player(interaction: discord.Interaction, name: str):
 async def factions(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    stats = get_faction_stats()
+    stats = await run_sheet_io(get_faction_stats)
 
     table = build_faction_table(stats)
 
@@ -5246,21 +5295,6 @@ async def session_cleanup(interaction: discord.Interaction):
 # =========================================================
 @client.event
 async def on_ready():
-    try:
-        ensure_botdata_schema()
-        get_botdata_records(force_refresh=True)
-    except Exception as exc:
-        print(f"BotData konnte beim Start nicht vorbereitet werden: {exc}")
-
-    try:
-        sort_sessions_sheet_by_start()
-    except Exception as exc:
-        print(f"Sessions-Sheet konnte beim Start nicht sortiert werden: {exc}")
-
-    if not session_reminder_loop.is_running():
-        session_reminder_loop.start()
-
-    await tree.sync()
     print(f"Bot läuft als {client.user} | Build: {BOT_BUILD}")
 
 
