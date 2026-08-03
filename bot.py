@@ -8,13 +8,24 @@ from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import os
 import json
 import re
 import time
 import uuid
+
+from session_planning import (
+    CHOICE_BOTH,
+    CHOICE_CANNOT,
+    CHOICE_LABELS,
+    CHOICE_SATURDAY,
+    CHOICE_SUNDAY,
+    evaluate_weekend,
+    fairness_points,
+    parse_weekend_date,
+)
 
 # =========================================================
 # 🔐 DISCORD TOKEN
@@ -41,7 +52,9 @@ gc = gspread.authorize(creds)
 SHEET_ID = "16QIygRCKOKSRWwsbWzcbG_zNEtLlBxVIokmy-xyqTxs"
 BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
-BOT_BUILD = "async-sheet-cache-v13"
+SESSION_PLANS_SHEET_NAME = "SessionPlans"
+SESSION_ATTENDANCE_SHEET_NAME = "SessionAttendance"
+BOT_BUILD = "session-planning-v14"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -161,6 +174,8 @@ _session_records_cache = {
 
 _botdata_worksheet = None
 _sessions_worksheet = None
+_session_plans_worksheet = None
+_session_attendance_worksheet = None
 _sheets_io_lock = asyncio.Lock()
 
 
@@ -2502,6 +2517,30 @@ SESSION_HEADERS = [
     "EventID"
 ]
 
+SESSION_PLAN_HEADERS = [
+    "PlanID",
+    "GuildID",
+    "ChannelID",
+    "CreatorID",
+    "WeekendSaturday",
+    "EndsAtUTC",
+    "DurationHours",
+    "MessageID",
+    "Status",
+    "VotesJSON",
+    "CreatedAt",
+    "SummaryMessageID"
+]
+
+SESSION_ATTENDANCE_HEADERS = [
+    "EventID",
+    "SessionID",
+    "GuildID",
+    "StartUTC",
+    "ParticipantIDs",
+    "ArchivedAt"
+]
+
 GERMAN_WEEKDAYS = [
     "Montag",
     "Dienstag",
@@ -2537,6 +2576,476 @@ class SessionDraft:
     start_utc: datetime
     location: str
     reminder_days: list[int]
+
+
+def get_tracking_sheet(sheet_name: str, headers: list[str], create=False):
+    global _session_plans_worksheet, _session_attendance_worksheet
+
+    if sheet_name == SESSION_PLANS_SHEET_NAME:
+        cached = _session_plans_worksheet
+    elif sheet_name == SESSION_ATTENDANCE_SHEET_NAME:
+        cached = _session_attendance_worksheet
+    else:
+        raise ValueError(f"Unbekanntes Tracking-Sheet: {sheet_name}")
+
+    if cached is not None:
+        return cached
+
+    try:
+        worksheet = spreadsheet.worksheet(sheet_name)
+    except WorksheetNotFound:
+        if not create:
+            return None
+        worksheet = spreadsheet.add_worksheet(
+            title=sheet_name,
+            rows=1000,
+            cols=len(headers)
+        )
+        worksheet.update(
+            values=[headers],
+            range_name=f"A1:{rowcol_to_a1(1, len(headers))}"
+        )
+
+    first_row = worksheet.row_values(1)
+    if not first_row:
+        worksheet.update(
+            values=[headers],
+            range_name=f"A1:{rowcol_to_a1(1, len(headers))}"
+        )
+    elif first_row[:len(headers)] != headers:
+        raise RuntimeError(
+            f"Das Tabellenblatt '{sheet_name}' hat unerwartete Spalten. "
+            "Bitte die Kopfzeile nicht manuell verändern."
+        )
+
+    if sheet_name == SESSION_PLANS_SHEET_NAME:
+        _session_plans_worksheet = worksheet
+    else:
+        _session_attendance_worksheet = worksheet
+    return worksheet
+
+
+def read_tracking_records(sheet_name: str, headers: list[str]):
+    worksheet = get_tracking_sheet(sheet_name, headers, create=False)
+    if worksheet is None:
+        return []
+
+    values = worksheet.get_all_values()
+    if len(values) < 2:
+        return []
+
+    records = []
+    actual_headers = values[0]
+    for row_index, row in enumerate(values[1:], start=2):
+        padded = row + [""] * max(0, len(actual_headers) - len(row))
+        record = dict(zip(actual_headers, padded))
+        record["_row"] = row_index
+        records.append(record)
+    return records
+
+
+def get_session_plan_records(guild_id=None, active_only=False):
+    records = read_tracking_records(SESSION_PLANS_SHEET_NAME, SESSION_PLAN_HEADERS)
+    return [
+        record for record in records
+        if (guild_id is None or str(record.get("GuildID")) == str(guild_id))
+        and (not active_only or str(record.get("Status", "")).lower() == "active")
+        and str(record.get("PlanID", "")).strip()
+    ]
+
+
+def get_session_plan_record(plan_id: str):
+    return next(
+        (
+            record for record in get_session_plan_records()
+            if str(record.get("PlanID")) == str(plan_id)
+        ),
+        None
+    )
+
+
+def append_session_plan_record(record):
+    worksheet = get_tracking_sheet(
+        SESSION_PLANS_SHEET_NAME,
+        SESSION_PLAN_HEADERS,
+        create=True
+    )
+    worksheet.append_row(
+        [str(record.get(header, "") or "") for header in SESSION_PLAN_HEADERS],
+        value_input_option="RAW"
+    )
+    return get_session_plan_record(record.get("PlanID"))
+
+
+def update_session_plan_record(row_number: int, updates: dict):
+    worksheet = get_tracking_sheet(
+        SESSION_PLANS_SHEET_NAME,
+        SESSION_PLAN_HEADERS,
+        create=True
+    )
+    header_columns = {
+        header: index for index, header in enumerate(SESSION_PLAN_HEADERS, start=1)
+    }
+    cells = [
+        gspread.Cell(row_number, header_columns[key], str(value))
+        for key, value in updates.items()
+        if key in header_columns
+    ]
+    if cells:
+        worksheet.update_cells(cells, value_input_option="RAW")
+
+
+def parse_plan_votes(record) -> dict:
+    try:
+        votes = json.loads(str(record.get("VotesJSON", "{}") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        votes = {}
+    return votes if isinstance(votes, dict) else {}
+
+
+def record_session_plan_vote(
+    plan_id: str,
+    user_id: int,
+    display_name: str,
+    choice: str,
+    voted_at: datetime
+):
+    record = get_session_plan_record(plan_id)
+    if record is None:
+        raise ValueError("Diese Terminabstimmung wurde nicht mehr gefunden.")
+
+    votes = parse_plan_votes(record)
+    user_key = str(user_id)
+    previous = votes.get(user_key, {})
+    timestamp = previous.get("voted_at") if previous.get("choice") == choice else None
+    votes[user_key] = {
+        "choice": choice,
+        "voted_at": timestamp or voted_at.astimezone(timezone.utc).isoformat(),
+        "display_name": str(display_name)[:100]
+    }
+    serialized = json.dumps(votes, ensure_ascii=False, separators=(",", ":"))
+    update_session_plan_record(record["_row"], {"VotesJSON": serialized})
+    record["VotesJSON"] = serialized
+    return record
+
+
+def get_session_attendance_records(guild_id=None):
+    records = read_tracking_records(
+        SESSION_ATTENDANCE_SHEET_NAME,
+        SESSION_ATTENDANCE_HEADERS
+    )
+    return [
+        record for record in records
+        if guild_id is None or str(record.get("GuildID")) == str(guild_id)
+    ]
+
+
+def archive_completed_session(record):
+    event_id = str(record.get("EventID", "")).strip()
+    session_id = str(record.get("SessionID", "")).strip()
+    existing = get_session_attendance_records(record.get("GuildID"))
+    if any(
+        (event_id and str(item.get("EventID", "")).strip() == event_id)
+        or (session_id and str(item.get("SessionID", "")).strip() == session_id)
+        for item in existing
+    ):
+        return
+
+    worksheet = get_tracking_sheet(
+        SESSION_ATTENDANCE_SHEET_NAME,
+        SESSION_ATTENDANCE_HEADERS,
+        create=True
+    )
+    history_record = {
+        "EventID": event_id,
+        "SessionID": session_id,
+        "GuildID": str(record.get("GuildID", "")),
+        "StartUTC": str(record.get("StartUTC", "")),
+        "ParticipantIDs": str(record.get("ParticipantIDs", "")),
+        "ArchivedAt": datetime.now(timezone.utc).isoformat()
+    }
+    worksheet.append_row(
+        [history_record.get(header, "") for header in SESSION_ATTENDANCE_HEADERS],
+        value_input_option="RAW"
+    )
+
+
+def get_participation_dates_by_user(guild_id: int, target_date: date) -> dict[str, list[date]]:
+    dates_by_user = {}
+    seen = set()
+    records = get_session_attendance_records(guild_id)
+    records.extend(get_session_records(guild_id=guild_id, active_only=True))
+
+    for record in records:
+        try:
+            start_utc = session_datetime_from_record(record)
+            local_date = start_utc.astimezone(SESSION_TIMEZONE).date()
+        except (TypeError, ValueError):
+            continue
+        if local_date > target_date:
+            continue
+
+        for user_id in parse_number_list(record.get("ParticipantIDs", "")):
+            key = (str(user_id), local_date)
+            if key in seen:
+                continue
+            seen.add(key)
+            dates_by_user.setdefault(str(user_id), []).append(local_date)
+    return dates_by_user
+
+
+def session_plan_saturday(record) -> date:
+    return date.fromisoformat(str(record.get("WeekendSaturday", "")))
+
+
+def session_plan_ends_at(record) -> datetime:
+    parsed = datetime.fromisoformat(
+        str(record.get("EndsAtUTC", "")).replace("Z", "+00:00")
+    )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def session_plan_vote_counts(record) -> dict[str, int]:
+    counts = {choice: 0 for choice in CHOICE_LABELS}
+    for vote in parse_plan_votes(record).values():
+        choice = vote.get("choice")
+        if choice in counts:
+            counts[choice] += 1
+    return counts
+
+
+def format_plan_day(value: date) -> str:
+    return (
+        f"{GERMAN_WEEKDAYS[value.weekday()]}, {value.day}. "
+        f"{GERMAN_MONTHS[value.month - 1]} {value.year}"
+    )
+
+
+def build_session_plan_embed(record, closed=False) -> discord.Embed:
+    saturday = session_plan_saturday(record)
+    sunday = saturday + timedelta(days=1)
+    ends_local = session_plan_ends_at(record).astimezone(SESSION_TIMEZONE)
+    counts = session_plan_vote_counts(record)
+    status_text = "Abstimmung beendet" if closed else "Abstimmung läuft"
+    embed = discord.Embed(
+        title=f"📅 Terminabstimmung · {saturday.strftime('%d.%m.')} / {sunday.strftime('%d.%m.%Y')}",
+        description=(
+            f"**Samstag:** {format_plan_day(saturday)}\n"
+            f"**Sonntag:** {format_plan_day(sunday)}\n"
+            f"**Ende:** {ends_local.strftime('%d.%m.%Y um %H:%M Uhr')}\n\n"
+            "Wähle die Antwort aus, die für dieses Wochenende am besten passt. "
+            "Du kannst deine Antwort bis zum Ende der Abstimmung ändern."
+        ),
+        color=0x5865F2 if not closed else 0x95A5A6
+    )
+    embed.add_field(
+        name="Aktueller Stand",
+        value=(
+            f"Samstag: **{counts[CHOICE_SATURDAY]}**\n"
+            f"Sonntag: **{counts[CHOICE_SUNDAY]}**\n"
+            f"Beide Tage möglich: **{counts[CHOICE_BOTH]}**\n"
+            f"Kann nicht: **{counts[CHOICE_CANNOT]}**"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="So wird ausgewertet",
+        value=(
+            "Ein Termin kommt zustande, wenn für mindestens einen Tag sechs Teilnehmer "
+            "verfügbar sind. Sind beide Tage möglich, wird zuerst geprüft, welcher Tag "
+            "mehr Spielern mit 0 Fairnesspunkten einen Platz ermöglicht. Danach werden "
+            "die gemeinsame Punktzahl der vorgeschlagenen Teilnehmer und die Größe der "
+            "Warteliste verglichen. Bei einem vergleichbaren Ergebnis wird der Samstag "
+            "bevorzugt.\n\n"
+            "Die sechs Interessenten mit den wenigsten Punkten erhalten Vorrang. Bei "
+            "Punktgleichstand entscheidet der frühere Abstimmungszeitpunkt. Weitere "
+            "Interessenten kommen in derselben Reihenfolge auf die Warteliste. Die Punkte "
+            "richten sich nach dem Abstand zur letzten tatsächlichen oder bereits fest "
+            "geplanten Teilnahme und fallen nach vier Wochen automatisch auf null."
+        ),
+        inline=False
+    )
+    embed.set_footer(text=f"{status_text} · Plan-ID {record.get('PlanID', '-')}")
+    return embed
+
+
+def evaluate_session_plan_record(record):
+    saturday = session_plan_saturday(record)
+    votes = parse_plan_votes(record)
+    participation_dates = get_participation_dates_by_user(
+        int(record.get("GuildID")),
+        saturday
+    )
+    points_by_user = {
+        str(user_id): fairness_points(
+            saturday,
+            participation_dates.get(str(user_id), [])
+        )
+        for user_id in votes
+    }
+    return evaluate_weekend(votes, points_by_user)
+
+
+def format_ranked_plan_users(users) -> str:
+    if not users:
+        return "–"
+    lines = []
+    for index, user in enumerate(users, start=1):
+        name = discord.utils.escape_markdown(str(user.get("display_name", "Unbekannt")))
+        points = int(user.get("points", 0))
+        point_text = "1 Punkt" if points == 1 else f"{points} Punkte"
+        lines.append(f"{index}. **{name}** · {point_text}")
+    return "\n".join(lines)
+
+
+def build_session_plan_summary_embed(record, evaluation) -> discord.Embed:
+    saturday = session_plan_saturday(record)
+    sunday = saturday + timedelta(days=1)
+    chosen = evaluation.get("chosen")
+    if chosen is None:
+        title = "📊 Terminabstimmung ausgewertet · kein Termin möglich"
+        color = 0xE67E22
+    else:
+        chosen_date = saturday if chosen["day"] == CHOICE_SATURDAY else sunday
+        title = f"📊 Terminvorschlag · {format_plan_day(chosen_date)}"
+        color = 0x2ECC71
+
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"**Samstag:** {evaluation['saturday']['candidate_count']} Interessenten\n"
+            f"**Sonntag:** {evaluation['sunday']['candidate_count']} Interessenten\n\n"
+            f"**Begründung:** {evaluation['reason']}"
+        ),
+        color=color
+    )
+    if chosen is not None:
+        embed.add_field(
+            name="Vorgeschlagene Teilnehmer",
+            value=format_ranked_plan_users(chosen["selected"]),
+            inline=False
+        )
+        embed.add_field(
+            name="Warteliste",
+            value=format_ranked_plan_users(chosen["waitlist"]),
+            inline=False
+        )
+        embed.add_field(
+            name="Nächster Schritt",
+            value=(
+                "Der Termin wurde noch nicht angelegt. Prüfe den Vorschlag und verwende "
+                "anschließend `/session create`."
+            ),
+            inline=False
+        )
+    embed.set_footer(text=f"Plan-ID {record.get('PlanID', '-')}")
+    return embed
+
+
+class SessionPlanVoteSelect(discord.ui.Select):
+    def __init__(self, plan_id: str):
+        self.plan_id = str(plan_id)
+        options = [
+            discord.SelectOption(
+                label="Samstag",
+                value=CHOICE_SATURDAY,
+                emoji="🗓️"
+            ),
+            discord.SelectOption(
+                label="Sonntag",
+                value=CHOICE_SUNDAY,
+                emoji="☀️"
+            ),
+            discord.SelectOption(
+                label="Beide Tage möglich",
+                value=CHOICE_BOTH,
+                emoji="✅"
+            ),
+            discord.SelectOption(
+                label="Kann nicht",
+                value=CHOICE_CANNOT,
+                emoji="❌"
+            )
+        ]
+        super().__init__(
+            placeholder="Wähle deine Verfügbarkeit",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"session-plan-vote:{self.plan_id}"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            record = await run_sheet_io(get_session_plan_record, self.plan_id)
+        except Exception as exc:
+            await interaction.response.send_message(
+                f"Die Abstimmung konnte nicht geladen werden: `{exc}`",
+                ephemeral=True
+            )
+            return
+
+        if record is None or str(record.get("Status", "")).lower() != "active":
+            await interaction.response.send_message(
+                "Diese Terminabstimmung ist bereits beendet.",
+                ephemeral=True
+            )
+            return
+        if datetime.now(timezone.utc) >= session_plan_ends_at(record):
+            await interaction.response.send_message(
+                "Die Abstimmungszeit ist bereits abgelaufen. Die Auswertung folgt in Kürze.",
+                ephemeral=True
+            )
+            return
+
+        choice = self.values[0]
+        display_name = getattr(interaction.user, "display_name", interaction.user.name)
+        try:
+            updated_record = await run_sheet_io(
+                record_session_plan_vote,
+                self.plan_id,
+                interaction.user.id,
+                display_name,
+                choice,
+                datetime.now(timezone.utc)
+            )
+        except Exception as exc:
+            await interaction.response.send_message(
+                f"Deine Auswahl konnte nicht gespeichert werden: `{exc}`",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.message.edit(
+                embed=build_session_plan_embed(updated_record),
+                view=self.view
+            )
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(
+            f"Deine Auswahl **{CHOICE_LABELS[choice]}** wurde gespeichert.",
+            ephemeral=True
+        )
+
+
+class SessionPlanVoteView(discord.ui.View):
+    def __init__(self, plan_id: str):
+        super().__init__(timeout=None)
+        self.add_item(SessionPlanVoteSelect(plan_id))
+
+
+def find_active_session_plan(guild_id: int, saturday: date):
+    return next(
+        (
+            record for record in get_session_plan_records(guild_id, active_only=True)
+            if str(record.get("WeekendSaturday")) == saturday.isoformat()
+        ),
+        None
+    )
 
 
 def get_sessions_sheet(create=False):
@@ -4829,6 +5338,87 @@ async def resolve_session_channel(record):
     return None
 
 
+async def finalize_session_plan(record):
+    try:
+        evaluation = await run_sheet_io(evaluate_session_plan_record, record)
+    except Exception as exc:
+        print(f"Session-Plan {record.get('PlanID')}: Auswertung fehlgeschlagen: {exc}")
+        return
+
+    try:
+        channel_id = int(record.get("ChannelID", 0))
+    except (TypeError, ValueError):
+        channel_id = 0
+    channel = client.get_channel(channel_id) if channel_id else None
+    if channel is None and channel_id:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            channel = None
+    if channel is None:
+        print(f"Session-Plan {record.get('PlanID')}: Kanal nicht gefunden")
+        return
+
+    try:
+        message_id = int(record.get("MessageID", 0))
+    except (TypeError, ValueError):
+        message_id = 0
+    if message_id:
+        try:
+            poll_message = await channel.fetch_message(message_id)
+            await poll_message.edit(
+                embed=build_session_plan_embed(record, closed=True),
+                view=None
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    try:
+        summary_message = await channel.send(
+            embed=build_session_plan_summary_embed(record, evaluation),
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        print(f"Session-Plan {record.get('PlanID')}: Zusammenfassung fehlgeschlagen: {exc}")
+        return
+
+    try:
+        await run_sheet_io(
+            update_session_plan_record,
+            record["_row"],
+            {
+                "Status": "completed",
+                "SummaryMessageID": str(summary_message.id)
+            }
+        )
+    except Exception as exc:
+        print(f"Session-Plan {record.get('PlanID')}: Abschluss konnte nicht gespeichert werden: {exc}")
+
+
+@tasks.loop(minutes=1)
+async def session_plan_loop():
+    try:
+        records = await run_sheet_io(get_session_plan_records, None, True)
+    except Exception as exc:
+        print(f"Session-Plan: aktive Abstimmungen konnten nicht geladen werden: {exc}")
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    for record in records:
+        try:
+            is_due = session_plan_ends_at(record) <= now_utc
+        except (TypeError, ValueError):
+            print(f"Session-Plan {record.get('PlanID')}: ungültige Endzeit")
+            continue
+        if is_due:
+            await finalize_session_plan(record)
+
+
+@session_plan_loop.before_loop
+async def before_session_plan_loop():
+    await client.wait_until_ready()
+
+
 @tasks.loop(minutes=5)
 async def session_reminder_loop():
     try:
@@ -4852,6 +5442,7 @@ async def session_reminder_loop():
 
         if start_utc <= now_utc:
             try:
+                await run_sheet_io(archive_completed_session, record)
                 await run_sheet_io(delete_session_records_for_event, record)
             except Exception as exc:
                 try:
@@ -4934,8 +5525,23 @@ async def setup_bot_backend():
     except Exception as exc:
         print(f"Sessions-Sheet konnte beim Start nicht sortiert werden: {exc}")
 
+    try:
+        active_plans = await run_sheet_io(get_session_plan_records, None, True)
+        for plan_record in active_plans:
+            message_id = str(plan_record.get("MessageID", "")).strip()
+            if message_id.isdigit():
+                client.add_view(
+                    SessionPlanVoteView(plan_record["PlanID"]),
+                    message_id=int(message_id)
+                )
+    except Exception as exc:
+        print(f"Aktive Terminabstimmungen konnten nicht wiederhergestellt werden: {exc}")
+
     if not session_reminder_loop.is_running():
         session_reminder_loop.start()
+
+    if not session_plan_loop.is_running():
+        session_plan_loop.start()
 
     if not reference_data_refresh_loop.is_running():
         reference_data_refresh_loop.start()
@@ -5146,6 +5752,145 @@ async def add_game(interaction: discord.Interaction):
 # =========================================================
 # 📅 /session
 # =========================================================
+@session.command(
+    name="plan",
+    description="Startet eine faire Terminabstimmung für ein Wochenende"
+)
+@app_commands.describe(
+    date="Samstag oder Sonntag des zu planenden Wochenendes (TT.MM.JJJJ)",
+    duration_hours="Laufzeit der Abstimmung in Stunden (Standard: 24)"
+)
+@app_commands.guild_only()
+async def session_plan(
+    interaction: discord.Interaction,
+    date: str,
+    duration_hours: app_commands.Range[int, 1, 168] = 24
+):
+    permissions = getattr(interaction.user, "guild_permissions", None)
+    if not permissions or not permissions.manage_events:
+        await interaction.response.send_message(
+            "Du benötigst die Berechtigung **Events verwalten**.",
+            ephemeral=True
+        )
+        return
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message(
+            "Dieser Befehl kann nur in einem Serverkanal verwendet werden.",
+            ephemeral=True
+        )
+        return
+
+    bot_member = interaction.guild.me
+    channel_permissions = interaction.channel.permissions_for(bot_member)
+    missing_permissions = []
+    if not channel_permissions.view_channel:
+        missing_permissions.append("Kanal ansehen")
+    if not channel_permissions.send_messages:
+        missing_permissions.append("Nachrichten senden")
+    if not channel_permissions.embed_links:
+        missing_permissions.append("Links einbetten")
+    if not channel_permissions.mention_everyone:
+        missing_permissions.append("@everyone, @here und alle Rollen erwähnen")
+    if missing_permissions:
+        await interaction.response.send_message(
+            "Dem Bot fehlen in diesem Kanal folgende Berechtigungen: "
+            + ", ".join(f"**{permission}**" for permission in missing_permissions),
+            ephemeral=True
+        )
+        return
+
+    try:
+        saturday = parse_weekend_date(
+            date,
+            today=datetime.now(SESSION_TIMEZONE).date()
+        )
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    try:
+        existing = await run_sheet_io(
+            find_active_session_plan,
+            interaction.guild.id,
+            saturday
+        )
+    except Exception as exc:
+        await interaction.edit_original_response(
+            content=f"Die Terminabstimmungen konnten nicht geprüft werden: `{exc}`"
+        )
+        return
+    if existing is not None:
+        await interaction.edit_original_response(
+            content=(
+                "Für dieses Wochenende läuft bereits eine Terminabstimmung "
+                f"(`{existing.get('PlanID')}`)."
+            )
+        )
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    plan_id = uuid.uuid4().hex[:8]
+    record = {
+        "PlanID": plan_id,
+        "GuildID": str(interaction.guild.id),
+        "ChannelID": str(interaction.channel.id),
+        "CreatorID": str(interaction.user.id),
+        "WeekendSaturday": saturday.isoformat(),
+        "EndsAtUTC": (now_utc + timedelta(hours=int(duration_hours))).isoformat(),
+        "DurationHours": str(int(duration_hours)),
+        "MessageID": "",
+        "Status": "active",
+        "VotesJSON": "{}",
+        "CreatedAt": now_utc.isoformat(),
+        "SummaryMessageID": ""
+    }
+    try:
+        stored_record = await run_sheet_io(append_session_plan_record, record)
+        if stored_record is None:
+            raise RuntimeError("Der gespeicherte Plan konnte nicht erneut geladen werden.")
+        record = stored_record
+    except Exception as exc:
+        await interaction.edit_original_response(
+            content=f"Die Terminabstimmung konnte nicht gespeichert werden: `{exc}`"
+        )
+        return
+
+    view = SessionPlanVoteView(plan_id)
+    try:
+        message = await interaction.edit_original_response(
+            content="@everyone",
+            embed=build_session_plan_embed(record),
+            view=view,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=True,
+                roles=False,
+                users=False,
+                replied_user=False
+            )
+        )
+        await run_sheet_io(
+            update_session_plan_record,
+            record["_row"],
+            {"MessageID": str(message.id)}
+        )
+    except Exception as exc:
+        try:
+            await interaction.edit_original_response(
+                content=f"Die Terminabstimmung konnte nicht veröffentlicht werden: `{exc}`",
+                embed=None,
+                view=None,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            await run_sheet_io(
+                update_session_plan_record,
+                record["_row"],
+                {"Status": "failed"}
+            )
+        except Exception:
+            pass
+
+
 @session.command(
     name="create",
     description="Legt einen Termin mit Teilnehmern und Erinnerungen an"
