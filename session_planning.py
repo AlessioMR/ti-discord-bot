@@ -6,17 +6,19 @@ from datetime import date, datetime, timedelta, timezone
 CHOICE_SATURDAY = "saturday"
 CHOICE_SUNDAY = "sunday"
 CHOICE_BOTH = "both"
+CHOICE_AVAILABLE = "available"
 CHOICE_CANNOT = "cannot"
 
 CHOICE_LABELS = {
     CHOICE_SATURDAY: "Samstag",
     CHOICE_SUNDAY: "Sonntag",
-    CHOICE_BOTH: "Beide Tage möglich",
+    CHOICE_BOTH: "Beide Tage möglich (nur ein Spieltermin)",
+    CHOICE_AVAILABLE: "Ich kann",
     CHOICE_CANNOT: "Kann nicht",
 }
 
 
-def parse_weekend_date(value: str, today: date | None = None) -> date:
+def _parse_date(value: str) -> date:
     value = str(value).strip()
     parsed = None
 
@@ -29,6 +31,11 @@ def parse_weekend_date(value: str, today: date | None = None) -> date:
 
     if parsed is None:
         raise ValueError("Ungültiges Datum. Nutze `TT.MM.JJJJ`, z.B. `05.09.2026`.")
+    return parsed
+
+
+def parse_weekend_date(value: str, today: date | None = None) -> date:
+    parsed = _parse_date(value)
     if parsed.weekday() not in {5, 6}:
         raise ValueError("Bitte gib einen Samstag oder Sonntag des gewünschten Wochenendes an.")
 
@@ -38,32 +45,34 @@ def parse_weekend_date(value: str, today: date | None = None) -> date:
     return saturday
 
 
-def weekend_week_start(value: date) -> date:
-    return value - timedelta(days=value.weekday())
+def parse_plan_date(value: str, today: date | None = None) -> date:
+    parsed = _parse_date(value)
+    plan_date = parsed - timedelta(days=1) if parsed.weekday() == 6 else parsed
+    if plan_date < (today or date.today()):
+        raise ValueError("Das zu planende Datum darf nicht in der Vergangenheit liegen.")
+    return plan_date
 
 
 def fairness_points(target_date: date, participation_dates) -> int:
-    target_week = weekend_week_start(target_date)
-    previous_weeks = []
+    previous_dates = []
 
     for participation_date in participation_dates:
         if isinstance(participation_date, datetime):
             participation_date = participation_date.date()
-        participation_week = weekend_week_start(participation_date)
-        if participation_week <= target_week:
-            previous_weeks.append(participation_week)
+        if participation_date <= target_date:
+            previous_dates.append(participation_date)
 
-    if not previous_weeks:
+    if not previous_dates:
         return 0
 
-    weeks_since = (target_week - max(previous_weeks)).days // 7
-    if weeks_since <= 0:
+    days_since = (target_date - max(previous_dates)).days
+    if days_since < 7:
         return 4
-    if weeks_since == 1:
+    if days_since < 14:
         return 3
-    if weeks_since == 2:
+    if days_since < 21:
         return 2
-    if weeks_since == 3:
+    if days_since < 28:
         return 1
     return 0
 
@@ -120,6 +129,34 @@ def build_day_result(votes: dict, points_by_user: dict, day: str) -> dict:
         "waitlist": waitlist,
         "zero_point_selected": sum(candidate["points"] == 0 for candidate in selected),
         "selected_points_sum": sum(candidate["points"] for candidate in selected),
+    }
+
+
+def evaluate_single_date(votes: dict, points_by_user: dict) -> dict:
+    ranked = rank_candidates(votes, {CHOICE_AVAILABLE}, points_by_user)
+    result = {
+        "candidate_count": len(ranked),
+        "viable": len(ranked) >= 6,
+        "ranked": ranked,
+        "selected": ranked[:6] if len(ranked) >= 6 else [],
+        "waitlist": ranked[6:] if len(ranked) >= 6 else [],
+    }
+    if result["viable"]:
+        reason = (
+            f"Für diesen Termin haben {result['candidate_count']} Interessenten zugesagt. "
+            "Die sechs Spieler mit der höchsten Priorität werden vorgeschlagen."
+        )
+        chosen = result
+    else:
+        reason = (
+            f"Für diesen Termin haben nur {result['candidate_count']} Interessenten zugesagt; "
+            "für einen Terminvorschlag werden mindestens sechs benötigt."
+        )
+        chosen = None
+    return {
+        "chosen": chosen,
+        "reason": reason,
+        "single": result,
     }
 
 

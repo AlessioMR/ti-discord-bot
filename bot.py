@@ -17,14 +17,16 @@ import time
 import uuid
 
 from session_planning import (
+    CHOICE_AVAILABLE,
     CHOICE_BOTH,
     CHOICE_CANNOT,
     CHOICE_LABELS,
     CHOICE_SATURDAY,
     CHOICE_SUNDAY,
+    evaluate_single_date,
     evaluate_weekend,
     fairness_points,
-    parse_weekend_date,
+    parse_plan_date,
 )
 
 # =========================================================
@@ -54,7 +56,7 @@ BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
 SESSION_PLANS_SHEET_NAME = "SessionPlans"
 SESSION_ATTENDANCE_SHEET_NAME = "SessionAttendance"
-BOT_BUILD = "session-planning-controls-v15"
+BOT_BUILD = "session-special-dates-v16"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -2794,8 +2796,12 @@ def get_participation_dates_by_user(guild_id: int, target_date: date) -> dict[st
     return dates_by_user
 
 
-def session_plan_saturday(record) -> date:
+def session_plan_date(record) -> date:
     return date.fromisoformat(str(record.get("WeekendSaturday", "")))
+
+
+def is_single_date_session_plan(record) -> bool:
+    return session_plan_date(record).weekday() < 5
 
 
 def session_plan_ends_at(record) -> datetime:
@@ -2824,8 +2830,9 @@ def format_plan_day(value: date) -> str:
 
 
 def build_session_plan_embed(record, closed=False, cancelled=False) -> discord.Embed:
-    saturday = session_plan_saturday(record)
-    sunday = saturday + timedelta(days=1)
+    plan_date = session_plan_date(record)
+    single_date = is_single_date_session_plan(record)
+    sunday = plan_date + timedelta(days=1)
     ends_local = session_plan_ends_at(record).astimezone(SESSION_TIMEZONE)
     counts = session_plan_vote_counts(record)
     if cancelled:
@@ -2834,46 +2841,69 @@ def build_session_plan_embed(record, closed=False, cancelled=False) -> discord.E
         status_text = "Abstimmung beendet"
     else:
         status_text = "Abstimmung läuft"
-    embed = discord.Embed(
-        title=f"📅 Terminabstimmung · {saturday.strftime('%d.%m.')} / {sunday.strftime('%d.%m.%Y')}",
-        description=(
-            f"**Samstag:** {format_plan_day(saturday)}\n"
+    if single_date:
+        title = f"📅 Terminabstimmung · Sondertermin · {plan_date.strftime('%d.%m.%Y')}"
+        description = (
+            f"**Sondertermin:** {format_plan_day(plan_date)}\n"
+            f"**Ende der Terminabstimmung:** {ends_local.strftime('%d.%m.%Y um %H:%M Uhr')}\n\n"
+            "Wähle aus, ob du an diesem Termin teilnehmen kannst. Du kannst deine Antwort "
+            "bis zum Ende der Abstimmung ändern. Jeder nur eine Stimme."
+        )
+        current_status = (
+            f"Ich kann: **{counts[CHOICE_AVAILABLE]}**\n"
+            f"Kann nicht: **{counts[CHOICE_CANNOT]}**"
+        )
+    else:
+        title = (
+            f"📅 Terminabstimmung · {plan_date.strftime('%d.%m.')} / "
+            f"{sunday.strftime('%d.%m.%Y')}"
+        )
+        description = (
+            f"**Samstag:** {format_plan_day(plan_date)}\n"
             f"**Sonntag:** {format_plan_day(sunday)}\n"
             f"**Ende der Terminabstimmung:** {ends_local.strftime('%d.%m.%Y um %H:%M Uhr')}\n\n"
             "Wähle die Antwort aus, die für dieses Wochenende am besten passt. "
             "Du kannst deine Antwort bis zum Ende der Abstimmung ändern. Jeder nur eine Stimme."
-        ),
+        )
+        current_status = (
+            f"Samstag: **{counts[CHOICE_SATURDAY]}**\n"
+            f"Sonntag: **{counts[CHOICE_SUNDAY]}**\n"
+            f"Beide Tage möglich (nur ein Spieltermin): **{counts[CHOICE_BOTH]}**\n"
+            f"Kann nicht: **{counts[CHOICE_CANNOT]}**"
+        )
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
         color=0xE74C3C if cancelled else (0x5865F2 if not closed else 0x95A5A6)
     )
     embed.add_field(
         name="Aktueller Stand",
-        value=(
-            f"Samstag: **{counts[CHOICE_SATURDAY]}**\n"
-            f"Sonntag: **{counts[CHOICE_SUNDAY]}**\n"
-            f"Beide Tage möglich: **{counts[CHOICE_BOTH]}**\n"
-            f"Kann nicht: **{counts[CHOICE_CANNOT]}**"
-        ),
+        value=current_status,
         inline=False
     )
-    embed.add_field(
-        name="So wird ausgewertet",
-        value=(
-            "**Punkte:** Sie zeigen, wie kürzlich jemand gespielt hat oder bereits fest "
-            "eingeplant ist. Eine Teilnahme am selben Wochenende zählt 4 Punkte, ein "
-            "Wochenende Abstand 3 Punkte, zwei Wochenenden 2 Punkte, drei Wochenenden "
-            "1 Punkt und ab vier Wochenenden 0 Punkte. Weniger Punkte bedeuten eine "
-            "höhere Priorität.\n\n"
-            "**Teilnehmerauswahl:**\n"
-            "1. Die sechs Interessenten mit den wenigsten Punkten.\n"
-            "2. Bei Punktgleichstand entscheidet die frühere Stimme.\n"
-            "3. Weitere Interessenten kommen in derselben Reihenfolge auf die Warteliste.\n\n"
-            "**Wahl des Tages:**\n"
+    evaluation_text = (
+        "**Punkte:** Sie zeigen, wie kürzlich jemand gespielt hat oder bereits fest "
+        "eingeplant ist. Bei weniger als 7 Tagen Abstand sind es 4 Punkte, bei 7–13 "
+        "Tagen 3 Punkte, bei 14–20 Tagen 2 Punkte, bei 21–27 Tagen 1 Punkt und ab "
+        "28 Tagen 0 Punkte. Weniger Punkte bedeuten eine höhere Priorität.\n\n"
+        "**Prioritätenliste für die Teilnehmerauswahl:**\n"
+        "1. Die sechs Interessenten mit den wenigsten Punkten.\n"
+        "2. Bei Punktgleichstand entscheidet die frühere Stimme.\n"
+        "3. Weitere Interessenten kommen in derselben Reihenfolge auf die Warteliste."
+    )
+    if not single_date:
+        evaluation_text += (
+            "\n\n**Prioritätenliste für die Wahl des Tages:**\n"
             "1. Mindestens sechs Teilnehmer müssen verfügbar sein.\n"
             "2. Mehr vorgeschlagene Teilnehmer mit 0 Punkten.\n"
             "3. Niedrigere Gesamtpunktzahl der vorgeschlagenen sechs Teilnehmer.\n"
             "4. Größere Warteliste.\n"
             "5. Bei Gleichstand wird der Samstag bevorzugt."
-        ),
+        )
+    embed.add_field(
+        name="So wird ausgewertet",
+        value=evaluation_text,
         inline=False
     )
     embed.set_footer(text=f"{status_text} · Plan-ID {record.get('PlanID', '-')}")
@@ -2881,19 +2911,21 @@ def build_session_plan_embed(record, closed=False, cancelled=False) -> discord.E
 
 
 def evaluate_session_plan_record(record):
-    saturday = session_plan_saturday(record)
+    plan_date = session_plan_date(record)
     votes = parse_plan_votes(record)
     participation_dates = get_participation_dates_by_user(
         int(record.get("GuildID")),
-        saturday
+        plan_date
     )
     points_by_user = {
         str(user_id): fairness_points(
-            saturday,
+            plan_date,
             participation_dates.get(str(user_id), [])
         )
         for user_id in votes
     }
+    if is_single_date_session_plan(record):
+        return evaluate_single_date(votes, points_by_user)
     return evaluate_weekend(votes, points_by_user)
 
 
@@ -2910,24 +2942,36 @@ def format_ranked_plan_users(users) -> str:
 
 
 def build_session_plan_summary_embed(record, evaluation) -> discord.Embed:
-    saturday = session_plan_saturday(record)
-    sunday = saturday + timedelta(days=1)
+    plan_date = session_plan_date(record)
+    single_date = is_single_date_session_plan(record)
+    sunday = plan_date + timedelta(days=1)
     chosen = evaluation.get("chosen")
     if chosen is None:
         title = "📊 Terminabstimmung ausgewertet · kein Termin möglich"
         color = 0xE67E22
     else:
-        chosen_date = saturday if chosen["day"] == CHOICE_SATURDAY else sunday
+        chosen_date = (
+            plan_date
+            if single_date or chosen["day"] == CHOICE_SATURDAY
+            else sunday
+        )
         title = f"📊 Terminvorschlag · {format_plan_day(chosen_date)}"
         color = 0x2ECC71
 
-    embed = discord.Embed(
-        title=title,
-        description=(
+    if single_date:
+        result_description = (
+            f"**Sondertermin:** {evaluation['single']['candidate_count']} Interessenten\n\n"
+            f"**Begründung:** {evaluation['reason']}"
+        )
+    else:
+        result_description = (
             f"**Samstag:** {evaluation['saturday']['candidate_count']} Interessenten\n"
             f"**Sonntag:** {evaluation['sunday']['candidate_count']} Interessenten\n\n"
             f"**Begründung:** {evaluation['reason']}"
-        ),
+        )
+    embed = discord.Embed(
+        title=title,
+        description=result_description,
         color=color
     )
     if chosen is not None:
@@ -2954,30 +2998,44 @@ def build_session_plan_summary_embed(record, evaluation) -> discord.Embed:
 
 
 class SessionPlanVoteSelect(discord.ui.Select):
-    def __init__(self, plan_id: str):
+    def __init__(self, plan_id: str, single_date=False):
         self.plan_id = str(plan_id)
-        options = [
-            discord.SelectOption(
-                label="Samstag",
-                value=CHOICE_SATURDAY,
-                emoji="🗓️"
-            ),
-            discord.SelectOption(
-                label="Sonntag",
-                value=CHOICE_SUNDAY,
-                emoji="☀️"
-            ),
-            discord.SelectOption(
-                label="Beide Tage möglich",
-                value=CHOICE_BOTH,
-                emoji="✅"
-            ),
-            discord.SelectOption(
-                label="Kann nicht",
-                value=CHOICE_CANNOT,
-                emoji="❌"
-            )
-        ]
+        if single_date:
+            options = [
+                discord.SelectOption(
+                    label=CHOICE_LABELS[CHOICE_AVAILABLE],
+                    value=CHOICE_AVAILABLE,
+                    emoji="✅"
+                ),
+                discord.SelectOption(
+                    label=CHOICE_LABELS[CHOICE_CANNOT],
+                    value=CHOICE_CANNOT,
+                    emoji="❌"
+                )
+            ]
+        else:
+            options = [
+                discord.SelectOption(
+                    label=CHOICE_LABELS[CHOICE_SATURDAY],
+                    value=CHOICE_SATURDAY,
+                    emoji="🗓️"
+                ),
+                discord.SelectOption(
+                    label=CHOICE_LABELS[CHOICE_SUNDAY],
+                    value=CHOICE_SUNDAY,
+                    emoji="☀️"
+                ),
+                discord.SelectOption(
+                    label=CHOICE_LABELS[CHOICE_BOTH],
+                    value=CHOICE_BOTH,
+                    emoji="✅"
+                ),
+                discord.SelectOption(
+                    label=CHOICE_LABELS[CHOICE_CANNOT],
+                    value=CHOICE_CANNOT,
+                    emoji="❌"
+                )
+            ]
         super().__init__(
             placeholder="Wähle deine Verfügbarkeit",
             min_values=1,
@@ -3043,9 +3101,9 @@ class SessionPlanVoteSelect(discord.ui.Select):
 
 
 class SessionPlanVoteView(discord.ui.View):
-    def __init__(self, plan_id: str):
+    def __init__(self, plan_id: str, single_date=False):
         super().__init__(timeout=None)
-        self.add_item(SessionPlanVoteSelect(plan_id))
+        self.add_item(SessionPlanVoteSelect(plan_id, single_date=single_date))
 
 
 def get_open_session_plan_records(guild_id: int):
@@ -3054,26 +3112,30 @@ def get_open_session_plan_records(guild_id: int):
     for record in get_session_plan_records(guild_id, active_only=True):
         try:
             if session_plan_ends_at(record) > now_utc:
-                session_plan_saturday(record)
+                session_plan_date(record)
                 records.append(record)
         except (TypeError, ValueError):
             continue
-    return sorted(records, key=session_plan_saturday)
+    return sorted(records, key=session_plan_date)
 
 
 def build_session_plan_cancel_options(records):
     options = []
     for record in records[:25]:
-        saturday = session_plan_saturday(record)
-        sunday = saturday + timedelta(days=1)
+        plan_date = session_plan_date(record)
+        sunday = plan_date + timedelta(days=1)
         ends_local = session_plan_ends_at(record).astimezone(SESSION_TIMEZONE)
         vote_count = len(parse_plan_votes(record))
+        if is_single_date_session_plan(record):
+            label = f"Sondertermin · {plan_date.strftime('%d.%m.%Y')}"
+        else:
+            label = (
+                f"{plan_date.strftime('%d.%m.')} / "
+                f"{sunday.strftime('%d.%m.%Y')}"
+            )
         options.append(
             discord.SelectOption(
-                label=(
-                    f"{saturday.strftime('%d.%m.')} / "
-                    f"{sunday.strftime('%d.%m.%Y')}"
-                ),
+                label=label,
                 value=str(record.get("PlanID")),
                 description=(
                     f"Ende {ends_local.strftime('%d.%m. %H:%M')} · "
@@ -3115,13 +3177,17 @@ class SessionPlanCancelSelect(discord.ui.Select):
             )
             return
 
-        saturday = session_plan_saturday(record)
-        sunday = saturday + timedelta(days=1)
+        plan_date = session_plan_date(record)
+        sunday = plan_date + timedelta(days=1)
         ends_local = session_plan_ends_at(record).astimezone(SESSION_TIMEZONE)
+        if is_single_date_session_plan(record):
+            date_text = format_plan_day(plan_date)
+        else:
+            date_text = f"{format_plan_day(plan_date)} / {format_plan_day(sunday)}"
         await interaction.response.edit_message(
             content=(
                 "**Diese Terminabstimmung wirklich abbrechen?**\n"
-                f"🗓️ {format_plan_day(saturday)} / {format_plan_day(sunday)}\n"
+                f"🗓️ {date_text}\n"
                 f"⏰ Ende: {ends_local.strftime('%d.%m.%Y um %H:%M Uhr')}\n\n"
                 "Die Abstimmung wird geschlossen und nicht automatisch ausgewertet. "
                 "Bereits abgegebene Stimmen bleiben nur als interne Historie gespeichert."
@@ -3259,11 +3325,11 @@ class SessionPlanCancelConfirmView(discord.ui.View):
         )
 
 
-def find_active_session_plan(guild_id: int, saturday: date):
+def find_active_session_plan(guild_id: int, plan_date: date):
     return next(
         (
             record for record in get_session_plan_records(guild_id, active_only=True)
-            if str(record.get("WeekendSaturday")) == saturday.isoformat()
+            if str(record.get("WeekendSaturday")) == plan_date.isoformat()
         ),
         None
     )
@@ -5618,7 +5684,10 @@ async def setup_bot_backend():
             message_id = str(plan_record.get("MessageID", "")).strip()
             if message_id.isdigit():
                 client.add_view(
-                    SessionPlanVoteView(plan_record["PlanID"]),
+                    SessionPlanVoteView(
+                        plan_record["PlanID"],
+                        single_date=is_single_date_session_plan(plan_record)
+                    ),
                     message_id=int(message_id)
                 )
     except Exception as exc:
@@ -5841,10 +5910,10 @@ async def add_game(interaction: discord.Interaction):
 # =========================================================
 @session.command(
     name="plan",
-    description="Startet eine faire Terminabstimmung für ein Wochenende"
+    description="Startet eine faire Abstimmung für ein Wochenende oder einen Sondertermin"
 )
 @app_commands.describe(
-    date="Samstag oder Sonntag des zu planenden Wochenendes (TT.MM.JJJJ)",
+    date="Wochenend- oder einzelnes Sondertermin-Datum (TT.MM.JJJJ)",
     poll_duration="Duration of the poll in hours (default: 24)"
 )
 @app_commands.guild_only()
@@ -5887,7 +5956,7 @@ async def session_plan(
         return
 
     try:
-        saturday = parse_weekend_date(
+        plan_date = parse_plan_date(
             date,
             today=datetime.now(SESSION_TIMEZONE).date()
         )
@@ -5900,7 +5969,7 @@ async def session_plan(
         existing = await run_sheet_io(
             find_active_session_plan,
             interaction.guild.id,
-            saturday
+            plan_date
         )
     except Exception as exc:
         await interaction.edit_original_response(
@@ -5908,9 +5977,14 @@ async def session_plan(
         )
         return
     if existing is not None:
+        plan_label = (
+            "dieses Datum"
+            if plan_date.weekday() < 5
+            else "dieses Wochenende"
+        )
         await interaction.edit_original_response(
             content=(
-                "Für dieses Wochenende läuft bereits eine Terminabstimmung "
+                f"Für {plan_label} läuft bereits eine Terminabstimmung "
                 f"(`{existing.get('PlanID')}`)."
             )
         )
@@ -5923,7 +5997,7 @@ async def session_plan(
         "GuildID": str(interaction.guild.id),
         "ChannelID": str(interaction.channel.id),
         "CreatorID": str(interaction.user.id),
-        "WeekendSaturday": saturday.isoformat(),
+        "WeekendSaturday": plan_date.isoformat(),
         "EndsAtUTC": (now_utc + timedelta(hours=int(poll_duration))).isoformat(),
         "DurationHours": str(int(poll_duration)),
         "MessageID": "",
@@ -5943,7 +6017,10 @@ async def session_plan(
         )
         return
 
-    view = SessionPlanVoteView(plan_id)
+    view = SessionPlanVoteView(
+        plan_id,
+        single_date=is_single_date_session_plan(record)
+    )
     try:
         message = await interaction.edit_original_response(
             content="@everyone",
@@ -6021,7 +6098,7 @@ async def session_cancel_plan(interaction: discord.Interaction):
     records.sort(
         key=lambda record: (
             str(record.get("ChannelID")) != str(interaction.channel_id),
-            session_plan_saturday(record)
+            session_plan_date(record)
         )
     )
     await interaction.edit_original_response(

@@ -63,7 +63,39 @@ class BotImportTests(unittest.TestCase):
         evaluation_text = embed.fields[1].value
         self.assertIn("**Punkte:**", evaluation_text)
         self.assertNotIn("Fairnesspunkte", evaluation_text)
+        self.assertIn("Prioritätenliste für die Teilnehmerauswahl", evaluation_text)
+        self.assertIn("Prioritätenliste für die Wahl des Tages", evaluation_text)
         self.assertLessEqual(len(evaluation_text), 1024)
+
+        single_record = {
+            **record,
+            "PlanID": "single-test-plan",
+            "WeekendSaturday": "2026-12-25",
+        }
+        single_embed = bot.build_session_plan_embed(single_record)
+        self.assertIn("Sondertermin", single_embed.title)
+        self.assertIn("Ich kann", single_embed.fields[0].value)
+        single_evaluation_text = single_embed.fields[1].value
+        self.assertNotIn("Wahl des Tages", single_evaluation_text)
+        self.assertLessEqual(len(single_evaluation_text), 1024)
+        single_summary = bot.build_session_plan_summary_embed(
+            single_record,
+            {
+                "chosen": {"selected": [], "waitlist": []},
+                "reason": "Mindestens sechs Spieler sind verfügbar.",
+                "single": {"candidate_count": 6},
+            },
+        )
+        self.assertIn("Terminvorschlag", single_summary.title)
+        self.assertIn("6 Interessenten", single_summary.description)
+
+        weekend_view = bot.SessionPlanVoteView("weekend")
+        weekend_labels = [option.label for option in weekend_view.children[0].options]
+        self.assertIn("Beide Tage möglich (nur ein Spieltermin)", weekend_labels)
+
+        single_view = bot.SessionPlanVoteView("single", single_date=True)
+        single_labels = [option.label for option in single_view.children[0].options]
+        self.assertEqual(single_labels, ["Ich kann", "Kann nicht"])
 
 
 if __name__ == "__main__":
