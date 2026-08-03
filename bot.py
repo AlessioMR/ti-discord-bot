@@ -54,7 +54,7 @@ BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
 SESSION_PLANS_SHEET_NAME = "SessionPlans"
 SESSION_ATTENDANCE_SHEET_NAME = "SessionAttendance"
-BOT_BUILD = "session-planning-v14"
+BOT_BUILD = "session-planning-controls-v15"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -2823,22 +2823,27 @@ def format_plan_day(value: date) -> str:
     )
 
 
-def build_session_plan_embed(record, closed=False) -> discord.Embed:
+def build_session_plan_embed(record, closed=False, cancelled=False) -> discord.Embed:
     saturday = session_plan_saturday(record)
     sunday = saturday + timedelta(days=1)
     ends_local = session_plan_ends_at(record).astimezone(SESSION_TIMEZONE)
     counts = session_plan_vote_counts(record)
-    status_text = "Abstimmung beendet" if closed else "Abstimmung läuft"
+    if cancelled:
+        status_text = "Abstimmung abgebrochen"
+    elif closed:
+        status_text = "Abstimmung beendet"
+    else:
+        status_text = "Abstimmung läuft"
     embed = discord.Embed(
         title=f"📅 Terminabstimmung · {saturday.strftime('%d.%m.')} / {sunday.strftime('%d.%m.%Y')}",
         description=(
             f"**Samstag:** {format_plan_day(saturday)}\n"
             f"**Sonntag:** {format_plan_day(sunday)}\n"
-            f"**Ende:** {ends_local.strftime('%d.%m.%Y um %H:%M Uhr')}\n\n"
+            f"**Ende der Terminabstimmung:** {ends_local.strftime('%d.%m.%Y um %H:%M Uhr')}\n\n"
             "Wähle die Antwort aus, die für dieses Wochenende am besten passt. "
-            "Du kannst deine Antwort bis zum Ende der Abstimmung ändern."
+            "Du kannst deine Antwort bis zum Ende der Abstimmung ändern. Jeder nur eine Stimme."
         ),
-        color=0x5865F2 if not closed else 0x95A5A6
+        color=0xE74C3C if cancelled else (0x5865F2 if not closed else 0x95A5A6)
     )
     embed.add_field(
         name="Aktueller Stand",
@@ -2853,17 +2858,21 @@ def build_session_plan_embed(record, closed=False) -> discord.Embed:
     embed.add_field(
         name="So wird ausgewertet",
         value=(
-            "Ein Termin kommt zustande, wenn für mindestens einen Tag sechs Teilnehmer "
-            "verfügbar sind. Sind beide Tage möglich, wird zuerst geprüft, welcher Tag "
-            "mehr Spielern mit 0 Fairnesspunkten einen Platz ermöglicht. Danach werden "
-            "die gemeinsame Punktzahl der vorgeschlagenen Teilnehmer und die Größe der "
-            "Warteliste verglichen. Bei einem vergleichbaren Ergebnis wird der Samstag "
-            "bevorzugt.\n\n"
-            "Die sechs Interessenten mit den wenigsten Punkten erhalten Vorrang. Bei "
-            "Punktgleichstand entscheidet der frühere Abstimmungszeitpunkt. Weitere "
-            "Interessenten kommen in derselben Reihenfolge auf die Warteliste. Die Punkte "
-            "richten sich nach dem Abstand zur letzten tatsächlichen oder bereits fest "
-            "geplanten Teilnahme und fallen nach vier Wochen automatisch auf null."
+            "**Punkte:** Sie zeigen, wie kürzlich jemand gespielt hat oder bereits fest "
+            "eingeplant ist. Eine Teilnahme am selben Wochenende zählt 4 Punkte, ein "
+            "Wochenende Abstand 3 Punkte, zwei Wochenenden 2 Punkte, drei Wochenenden "
+            "1 Punkt und ab vier Wochenenden 0 Punkte. Weniger Punkte bedeuten eine "
+            "höhere Priorität.\n\n"
+            "**Teilnehmerauswahl:**\n"
+            "1. Die sechs Interessenten mit den wenigsten Punkten.\n"
+            "2. Bei Punktgleichstand entscheidet die frühere Stimme.\n"
+            "3. Weitere Interessenten kommen in derselben Reihenfolge auf die Warteliste.\n\n"
+            "**Wahl des Tages:**\n"
+            "1. Mindestens sechs Teilnehmer müssen verfügbar sein.\n"
+            "2. Mehr vorgeschlagene Teilnehmer mit 0 Punkten.\n"
+            "3. Niedrigere Gesamtpunktzahl der vorgeschlagenen sechs Teilnehmer.\n"
+            "4. Größere Warteliste.\n"
+            "5. Bei Gleichstand wird der Samstag bevorzugt."
         ),
         inline=False
     )
@@ -3027,7 +3036,8 @@ class SessionPlanVoteSelect(discord.ui.Select):
         except discord.HTTPException:
             pass
         await interaction.followup.send(
-            f"Deine Auswahl **{CHOICE_LABELS[choice]}** wurde gespeichert.",
+            f"Deine Auswahl **{CHOICE_LABELS[choice]}** wurde gespeichert. Du kannst dich "
+            "noch umentscheiden, solange die Abstimmung läuft.",
             ephemeral=True
         )
 
@@ -3036,6 +3046,217 @@ class SessionPlanVoteView(discord.ui.View):
     def __init__(self, plan_id: str):
         super().__init__(timeout=None)
         self.add_item(SessionPlanVoteSelect(plan_id))
+
+
+def get_open_session_plan_records(guild_id: int):
+    now_utc = datetime.now(timezone.utc)
+    records = []
+    for record in get_session_plan_records(guild_id, active_only=True):
+        try:
+            if session_plan_ends_at(record) > now_utc:
+                session_plan_saturday(record)
+                records.append(record)
+        except (TypeError, ValueError):
+            continue
+    return sorted(records, key=session_plan_saturday)
+
+
+def build_session_plan_cancel_options(records):
+    options = []
+    for record in records[:25]:
+        saturday = session_plan_saturday(record)
+        sunday = saturday + timedelta(days=1)
+        ends_local = session_plan_ends_at(record).astimezone(SESSION_TIMEZONE)
+        vote_count = len(parse_plan_votes(record))
+        options.append(
+            discord.SelectOption(
+                label=(
+                    f"{saturday.strftime('%d.%m.')} / "
+                    f"{sunday.strftime('%d.%m.%Y')}"
+                ),
+                value=str(record.get("PlanID")),
+                description=(
+                    f"Ende {ends_local.strftime('%d.%m. %H:%M')} · "
+                    f"{vote_count} Stimme{'n' if vote_count != 1 else ''}"
+                ),
+                emoji="🗳️"
+            )
+        )
+    return options
+
+
+class SessionPlanCancelSelect(discord.ui.Select):
+    def __init__(self, owner_id: int, records):
+        self.owner_id = owner_id
+        self.records = {
+            str(record.get("PlanID")): record
+            for record in records
+        }
+        super().__init__(
+            placeholder="Laufende Terminabstimmung auswählen",
+            min_values=1,
+            max_values=1,
+            options=build_session_plan_cancel_options(records)
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Befehl gestartet hat, kann eine Abstimmung auswählen.",
+                ephemeral=True
+            )
+            return
+
+        record = self.records.get(self.values[0])
+        if record is None:
+            await interaction.response.edit_message(
+                content="Die ausgewählte Terminabstimmung wurde nicht mehr gefunden.",
+                view=None
+            )
+            return
+
+        saturday = session_plan_saturday(record)
+        sunday = saturday + timedelta(days=1)
+        ends_local = session_plan_ends_at(record).astimezone(SESSION_TIMEZONE)
+        await interaction.response.edit_message(
+            content=(
+                "**Diese Terminabstimmung wirklich abbrechen?**\n"
+                f"🗓️ {format_plan_day(saturday)} / {format_plan_day(sunday)}\n"
+                f"⏰ Ende: {ends_local.strftime('%d.%m.%Y um %H:%M Uhr')}\n\n"
+                "Die Abstimmung wird geschlossen und nicht automatisch ausgewertet. "
+                "Bereits abgegebene Stimmen bleiben nur als interne Historie gespeichert."
+            ),
+            view=SessionPlanCancelConfirmView(self.owner_id, record)
+        )
+
+
+class SessionPlanCancelSelectView(discord.ui.View):
+    def __init__(self, owner_id: int, records):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.add_item(SessionPlanCancelSelect(owner_id, records))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Befehl gestartet hat, kann diese Auswahl verwenden.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+
+class SessionPlanCancelConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int, record):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.record = record
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Nur die Person, die den Befehl gestartet hat, kann diese Abstimmung abbrechen.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Abstimmung abbrechen",
+        style=discord.ButtonStyle.danger,
+        emoji="🛑"
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        if not permissions or not permissions.manage_events:
+            await interaction.response.send_message(
+                "Du benötigst die Berechtigung **Events verwalten**.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        try:
+            record = await run_sheet_io(
+                get_session_plan_record,
+                self.record.get("PlanID")
+            )
+        except Exception as exc:
+            await interaction.edit_original_response(
+                content=f"Die Terminabstimmung konnte nicht geladen werden: `{exc}`",
+                view=None
+            )
+            return
+
+        if record is None or str(record.get("Status", "")).lower() != "active":
+            await interaction.edit_original_response(
+                content="Diese Terminabstimmung ist nicht mehr aktiv.",
+                view=None
+            )
+            return
+        if datetime.now(timezone.utc) >= session_plan_ends_at(record):
+            await interaction.edit_original_response(
+                content="Die Abstimmungszeit ist bereits abgelaufen. Die Auswertung folgt in Kürze.",
+                view=None
+            )
+            return
+
+        try:
+            await run_sheet_io(
+                update_session_plan_record,
+                record["_row"],
+                {"Status": "cancelled"}
+            )
+        except Exception as exc:
+            await interaction.edit_original_response(
+                content=f"Die Terminabstimmung konnte nicht abgebrochen werden: `{exc}`",
+                view=None
+            )
+            return
+
+        record["Status"] = "cancelled"
+        warning = ""
+        try:
+            channel_id = int(record.get("ChannelID", 0))
+            message_id = int(record.get("MessageID", 0))
+            channel = client.get_channel(channel_id) if channel_id else None
+            if channel is None and channel_id:
+                channel = await client.fetch_channel(channel_id)
+            if channel is not None and message_id:
+                poll_message = await channel.fetch_message(message_id)
+                await poll_message.edit(
+                    embed=build_session_plan_embed(record, closed=True, cancelled=True),
+                    view=None
+                )
+        except (TypeError, ValueError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+            warning = " Die ursprüngliche Abstimmungsnachricht konnte nicht aktualisiert werden."
+
+        await interaction.edit_original_response(
+            content=(
+                "Die Terminabstimmung wurde abgebrochen. Sie wird nicht automatisch ausgewertet."
+                f"{warning}"
+            ),
+            view=None
+        )
+
+    @discord.ui.button(
+        label="Zurück / nicht abbrechen",
+        style=discord.ButtonStyle.secondary,
+        emoji="↩️"
+    )
+    async def abort(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Abgebrochen. Die Terminabstimmung läuft unverändert weiter.",
+            view=None
+        )
 
 
 def find_active_session_plan(guild_id: int, saturday: date):
@@ -4672,77 +4893,6 @@ async def get_selectable_server_session_records(
     return selectable_records[:25]
 
 
-async def build_session_cleanup_plan(guild):
-    native_events = await guild.fetch_scheduled_events(with_counts=False)
-    active_events = {
-        str(event.id): event
-        for event in native_events
-        if event.status in {
-            discord.EventStatus.scheduled,
-            discord.EventStatus.active
-        }
-    }
-    records = await run_sheet_io(
-        get_session_records,
-        active_only=False
-    )
-    guild_records = [
-        record for record in records
-        if str(record.get("GuildID", "")) == str(guild.id)
-        or str(record.get("EventID", "")) in active_events
-    ]
-    rows_to_delete = set()
-    orphan_rows = set()
-    duplicate_rows = set()
-    keep_by_event_id = {}
-
-    for record in guild_records:
-        event_id = str(record.get("EventID", "")).strip()
-
-        if str(record.get("GuildID", "")) == str(guild.id) and event_id not in active_events:
-            rows_to_delete.add(record["_row"])
-            orphan_rows.add(record["_row"])
-
-    for event_id, event in active_events.items():
-        matching_records = [
-            record for record in guild_records
-            if str(record.get("EventID", "")).strip() == event_id
-        ]
-
-        if not matching_records:
-            continue
-
-        keep_record = max(
-            matching_records,
-            key=lambda record: (
-                str(record.get("Status", "")).lower() == "active",
-                int(record.get("_row", 0))
-            )
-        )
-        keep_by_event_id[event_id] = (keep_record, event)
-
-        for duplicate in matching_records:
-            if duplicate["_row"] != keep_record["_row"]:
-                rows_to_delete.add(duplicate["_row"])
-                duplicate_rows.add(duplicate["_row"])
-
-    return {
-        "rows_to_delete": sorted(rows_to_delete, reverse=True),
-        "orphan_count": len(orphan_rows),
-        "duplicate_count": len(duplicate_rows),
-        "keep_by_event_id": keep_by_event_id
-    }
-
-
-def apply_session_cleanup_plan(guild, plan):
-    for record, event in plan["keep_by_event_id"].values():
-        repair_session_ids_from_native_event(guild.id, record, event)
-
-        if str(record.get("Status", "")).lower() != "active":
-            update_session_record(record["_row"], {"Status": "active"})
-
-    delete_session_records(plan["rows_to_delete"])
-
 
 async def perform_session_cancellation(
     interaction: discord.Interaction,
@@ -4968,80 +5118,6 @@ class SessionCancelConfirmView(discord.ui.View):
     ):
         await interaction.response.edit_message(
             content="Abgebrochen. Der Termin bleibt bestehen und Erinnerungen bleiben aktiv.",
-            view=None
-        )
-
-
-class SessionCleanupConfirmView(discord.ui.View):
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=300)
-        self.owner_id = owner_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "Nur die Person, die die Bereinigung gestartet hat, kann sie bestätigen.",
-                ephemeral=True
-            )
-            return False
-        return True
-
-    @discord.ui.button(
-        label="Sheet bereinigen",
-        style=discord.ButtonStyle.danger,
-        emoji="🧹"
-    )
-    async def confirm(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        permissions = getattr(interaction.user, "guild_permissions", None)
-
-        if not permissions or not permissions.manage_events:
-            await interaction.response.send_message(
-                "Du benötigst die Berechtigung **Events verwalten**.",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.defer()
-
-        try:
-            plan = await build_session_cleanup_plan(interaction.guild)
-            await run_sheet_io(
-                apply_session_cleanup_plan,
-                interaction.guild,
-                plan
-            )
-        except Exception as exc:
-            await interaction.edit_original_response(
-                content=f"Die Bereinigung ist fehlgeschlagen:\n```text\n{exc}\n```",
-                view=None
-            )
-            return
-
-        await interaction.edit_original_response(
-            content=(
-                f"Bereinigung abgeschlossen: **{len(plan['rows_to_delete'])}** Zeilen entfernt "
-                f"({plan['duplicate_count']} Duplikate, "
-                f"{plan['orphan_count']} nicht mehr vorhandene Termine)."
-            ),
-            view=None
-        )
-
-    @discord.ui.button(
-        label="Abbrechen",
-        style=discord.ButtonStyle.secondary,
-        emoji="✖️"
-    )
-    async def cancel(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        await interaction.response.edit_message(
-            content="Bereinigung abgebrochen. Es wurde nichts gelöscht.",
             view=None
         )
 
@@ -5339,6 +5415,17 @@ async def resolve_session_channel(record):
 
 
 async def finalize_session_plan(record):
+    try:
+        fresh_record = await run_sheet_io(
+            get_session_plan_record,
+            record.get("PlanID")
+        )
+    except Exception as exc:
+        print(f"Session-Plan {record.get('PlanID')}: Statusprüfung fehlgeschlagen: {exc}")
+        return
+    if fresh_record is None or str(fresh_record.get("Status", "")).lower() != "active":
+        return
+    record = fresh_record
     try:
         evaluation = await run_sheet_io(evaluate_session_plan_record, record)
     except Exception as exc:
@@ -5758,13 +5845,13 @@ async def add_game(interaction: discord.Interaction):
 )
 @app_commands.describe(
     date="Samstag oder Sonntag des zu planenden Wochenendes (TT.MM.JJJJ)",
-    duration_hours="Laufzeit der Abstimmung in Stunden (Standard: 24)"
+    poll_duration="Duration of the poll in hours (default: 24)"
 )
 @app_commands.guild_only()
 async def session_plan(
     interaction: discord.Interaction,
     date: str,
-    duration_hours: app_commands.Range[int, 1, 168] = 24
+    poll_duration: app_commands.Range[int, 1, 168] = 24
 ):
     permissions = getattr(interaction.user, "guild_permissions", None)
     if not permissions or not permissions.manage_events:
@@ -5837,8 +5924,8 @@ async def session_plan(
         "ChannelID": str(interaction.channel.id),
         "CreatorID": str(interaction.user.id),
         "WeekendSaturday": saturday.isoformat(),
-        "EndsAtUTC": (now_utc + timedelta(hours=int(duration_hours))).isoformat(),
-        "DurationHours": str(int(duration_hours)),
+        "EndsAtUTC": (now_utc + timedelta(hours=int(poll_duration))).isoformat(),
+        "DurationHours": str(int(poll_duration)),
         "MessageID": "",
         "Status": "active",
         "VotesJSON": "{}",
@@ -5889,6 +5976,58 @@ async def session_plan(
             )
         except Exception:
             pass
+
+
+@session.command(
+    name="cancel_plan",
+    description="Bricht eine laufende Terminabstimmung ab"
+)
+@app_commands.guild_only()
+async def session_cancel_plan(interaction: discord.Interaction):
+    permissions = getattr(interaction.user, "guild_permissions", None)
+    if not permissions or not permissions.manage_events:
+        await interaction.response.send_message(
+            "Du benötigst die Berechtigung **Events verwalten**.",
+            ephemeral=True
+        )
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Dieser Befehl kann nur auf einem Server verwendet werden.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        records = await run_sheet_io(
+            get_open_session_plan_records,
+            interaction.guild.id
+        )
+    except Exception as exc:
+        await interaction.edit_original_response(
+            content=f"Die laufenden Terminabstimmungen konnten nicht geladen werden: `{exc}`",
+            view=None
+        )
+        return
+
+    if not records:
+        await interaction.edit_original_response(
+            content="Es wurde keine laufende Terminabstimmung gefunden.",
+            view=None
+        )
+        return
+
+    records.sort(
+        key=lambda record: (
+            str(record.get("ChannelID")) != str(interaction.channel_id),
+            session_plan_saturday(record)
+        )
+    )
+    await interaction.edit_original_response(
+        content="Wähle die laufende Terminabstimmung aus, die du abbrechen möchtest:",
+        view=SessionPlanCancelSelectView(interaction.user.id, records[:25])
+    )
 
 
 @session.command(
@@ -5988,50 +6127,6 @@ async def session_remind(interaction: discord.Interaction):
         interaction,
         action="remind",
         require_manage=True
-    )
-
-
-@session.command(
-    name="cleanup",
-    description="Entfernt Duplikate und nicht mehr vorhandene Termine aus dem Sessions-Sheet"
-)
-@app_commands.guild_only()
-async def session_cleanup(interaction: discord.Interaction):
-    permissions = getattr(interaction.user, "guild_permissions", None)
-
-    if not permissions or not permissions.manage_events:
-        await interaction.response.send_message(
-            "Du benötigst die Berechtigung **Events verwalten**.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    try:
-        plan = await build_session_cleanup_plan(interaction.guild)
-    except Exception as exc:
-        await interaction.edit_original_response(
-            content=f"Die Bereinigung konnte nicht vorbereitet werden:\n```text\n{exc}\n```",
-            view=None
-        )
-        return
-
-    if not plan["rows_to_delete"]:
-        await interaction.edit_original_response(
-            content="Das Sessions-Sheet ist bereits sauber. Es wurden keine Zeilen gefunden.",
-            view=None
-        )
-        return
-
-    await interaction.edit_original_response(
-        content=(
-            f"Es würden **{len(plan['rows_to_delete'])}** Zeilen entfernt:\n"
-            f"• **{plan['duplicate_count']}** redundante Zeilen zu vorhandenen Events\n"
-            f"• **{plan['orphan_count']}** Zeilen ohne aktuell vorhandenes Discord-Event\n\n"
-            "Aktive Discord-Events und jeweils eine zugehörige Sheet-Zeile bleiben erhalten."
-        ),
-        view=SessionCleanupConfirmView(interaction.user.id)
     )
 
 
