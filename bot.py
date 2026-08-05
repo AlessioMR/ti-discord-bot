@@ -56,7 +56,7 @@ BOTDATA_SHEET_NAME = "BotData"
 SESSIONS_SHEET_NAME = "Sessions"
 SESSION_PLANS_SHEET_NAME = "SessionPlans"
 SESSION_ATTENDANCE_SHEET_NAME = "SessionAttendance"
-BOT_BUILD = "session-special-dates-v16"
+BOT_BUILD = "session-visible-voters-v17"
 
 spreadsheet = gc.open_by_key(SHEET_ID)
 sheet = spreadsheet.sheet1
@@ -2813,13 +2813,60 @@ def session_plan_ends_at(record) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def session_plan_vote_counts(record) -> dict[str, int]:
-    counts = {choice: 0 for choice in CHOICE_LABELS}
-    for vote in parse_plan_votes(record).values():
+def session_plan_votes_by_choice(record) -> dict[str, list[str]]:
+    grouped = {choice: [] for choice in CHOICE_LABELS}
+    votes = parse_plan_votes(record)
+    ordered_votes = sorted(
+        votes.items(),
+        key=lambda item: (
+            str(item[1].get("voted_at", "")),
+            str(item[0])
+        )
+    )
+    for user_id, vote in ordered_votes:
         choice = vote.get("choice")
-        if choice in counts:
-            counts[choice] += 1
-    return counts
+        if choice not in grouped:
+            continue
+        display_name = str(vote.get("display_name") or f"Spieler {user_id}")
+        safe_name = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(display_name)
+        )
+        grouped[choice].append(safe_name)
+    return grouped
+
+
+def format_session_plan_vote_overview(record, choices) -> str:
+    grouped = session_plan_votes_by_choice(record)
+    line_budget = max(120, (1024 - max(0, len(choices) - 1)) // len(choices))
+    lines = []
+
+    for choice in choices:
+        names = grouped.get(choice, [])
+        prefix = f"**{CHOICE_LABELS[choice]} ({len(names)}):** "
+        if not names:
+            lines.append(f"{prefix}–")
+            continue
+
+        shown = []
+        for name in names:
+            candidate = ", ".join([*shown, name])
+            remaining = len(names) - len(shown) - 1
+            suffix = f", … (+{remaining} weitere)" if remaining else ""
+            if len(prefix) + len(candidate) + len(suffix) <= line_budget:
+                shown.append(name)
+            else:
+                break
+
+        if not shown:
+            first_suffix = f", … (+{len(names) - 1} weitere)" if len(names) > 1 else ""
+            available = max(1, line_budget - len(prefix) - len(first_suffix) - 1)
+            shown.append(f"{names[0][:available]}…")
+
+        omitted = len(names) - len(shown)
+        suffix = f", … (+{omitted} weitere)" if omitted else ""
+        lines.append(f"{prefix}{', '.join(shown)}{suffix}")
+
+    return "\n".join(lines)
 
 
 def format_plan_day(value: date) -> str:
@@ -2834,7 +2881,6 @@ def build_session_plan_embed(record, closed=False, cancelled=False) -> discord.E
     single_date = is_single_date_session_plan(record)
     sunday = plan_date + timedelta(days=1)
     ends_local = session_plan_ends_at(record).astimezone(SESSION_TIMEZONE)
-    counts = session_plan_vote_counts(record)
     if cancelled:
         status_text = "Abstimmung abgebrochen"
     elif closed:
@@ -2850,8 +2896,10 @@ def build_session_plan_embed(record, closed=False, cancelled=False) -> discord.E
             "bis zum Ende der Abstimmung ändern. Jeder nur eine Stimme."
         )
         current_status = (
-            f"Ich kann: **{counts[CHOICE_AVAILABLE]}**\n"
-            f"Kann nicht: **{counts[CHOICE_CANNOT]}**"
+            format_session_plan_vote_overview(
+                record,
+                [CHOICE_AVAILABLE, CHOICE_CANNOT]
+            )
         )
     else:
         title = (
@@ -2866,10 +2914,10 @@ def build_session_plan_embed(record, closed=False, cancelled=False) -> discord.E
             "Du kannst deine Antwort bis zum Ende der Abstimmung ändern. Jeder nur eine Stimme."
         )
         current_status = (
-            f"Samstag: **{counts[CHOICE_SATURDAY]}**\n"
-            f"Sonntag: **{counts[CHOICE_SUNDAY]}**\n"
-            f"Beide Tage möglich (nur ein Spieltermin): **{counts[CHOICE_BOTH]}**\n"
-            f"Kann nicht: **{counts[CHOICE_CANNOT]}**"
+            format_session_plan_vote_overview(
+                record,
+                [CHOICE_SATURDAY, CHOICE_SUNDAY, CHOICE_BOTH, CHOICE_CANNOT]
+            )
         )
 
     embed = discord.Embed(
@@ -2878,7 +2926,7 @@ def build_session_plan_embed(record, closed=False, cancelled=False) -> discord.E
         color=0xE74C3C if cancelled else (0x5865F2 if not closed else 0x95A5A6)
     )
     embed.add_field(
-        name="Aktueller Stand",
+        name="Abgegebene Stimmen",
         value=current_status,
         inline=False
     )
